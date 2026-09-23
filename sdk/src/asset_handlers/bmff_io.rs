@@ -1187,12 +1187,17 @@ pub(crate) fn insert_fragment_merkle_boxes(
     relocate_single_file_fragments(input, output, &edits)
 }
 
-// `iloc`, `stco`, `co64`, `mfro`, `saio`, `sidx`, `tdhd`, and `tfra` elements contain absolute file offsets so they need to be adjusted based on whether content was added or removed.
+// Adjust absolute offsets in `iloc`, `stco`, `co64`, `saio`, `tfhd`, and `tfra`.
+// TFRA uses the replaced range in original-file coordinates; other handlers still
+// apply the delta unconditionally.
+// Validation is per table, not transactional: callers must discard output on error,
+// since earlier tables or entries may already have been patched.
 fn adjust_known_offsets<W: Write + CAIRead + ?Sized>(
-    mut output: &mut W,
+    output: &mut W,
     bmff_tree: &Arena<BoxInfo>,
     bmff_path_map: &HashMap<String, Vec<Token>>,
-    adjust: i32,
+    adjust: i64,
+    replaced: std::ops::Range<u64>,
 ) -> Result<()> {
     let start_pos = output.stream_position()?; // save starting point
 
@@ -1515,9 +1520,6 @@ fn adjust_known_offsets<W: Write + CAIRead + ?Sized>(
         }
     }
 
-    // map to store track to moof mapping
-    let mut track_id_to_moof_mapping = HashMap::new();
-
     // handle moof traf tfhd
     if let Some(tfhd_list) = bmff_path_map.get("/moof/traf/tfhd") {
         for tfhd_token in tfhd_list {
@@ -1540,15 +1542,7 @@ fn adjust_known_offsets<W: Write + CAIRead + ?Sized>(
             let (_version, tf_flags) = read_box_header_ext(output)?; // box extensions
 
             // track ID
-            let track_id = output.read_u32::<BigEndian>()?;
-
-            // get to outter moof box
-            let ancestors = tfhd_token.ancestors(bmff_tree);
-            for ancestor in ancestors {
-                if ancestor.data.path == "moof" {
-                    track_id_to_moof_mapping.insert(track_id, ancestor.data.offset);
-                }
-            }
+            let _track_id = output.read_u32::<BigEndian>()?;
 
             // fix up base offset and write out if flags indicate to do so
             if tf_flags & 1 == 1 {
@@ -1583,7 +1577,7 @@ fn adjust_known_offsets<W: Write + CAIRead + ?Sized>(
                 return Err(Error::InvalidAsset("Bad BMFF".to_string()));
             }
 
-            // read iloc box and patch
+            // read tfra box and patch
             output.seek(SeekFrom::Start(tfra_box_info.offset))?;
 
             // read header
@@ -1593,11 +1587,26 @@ fn adjust_known_offsets<W: Write + CAIRead + ?Sized>(
                 return Err(Error::InvalidAsset("Bad BMFF".to_string()));
             }
 
+            let box_end = tfra_box_info
+                .offset
+                .checked_add(tfra_box_info.size)
+                .ok_or_else(|| Error::InvalidAsset("Bad BMFF: tfra size overflow".to_string()))?;
+            if box_end.saturating_sub(output.stream_position()?) < 16 {
+                return Err(Error::InvalidAsset(
+                    "Bad BMFF: short tfra header".to_string(),
+                ));
+            }
+
             // read extended header
             let (version, _flags) = read_box_header_ext(output)?; // box extensions
+            if version > 1 {
+                return Err(Error::InvalidAsset(
+                    "Bad BMFF: unknown tfra version".to_string(),
+                ));
+            }
 
             // track ID
-            let track_id = output.read_u32::<BigEndian>()?;
+            let _track_id = output.read_u32::<BigEndian>()?;
 
             // tfr flags
             let tfra_info = output.read_u32::<BigEndian>()?;
@@ -1608,38 +1617,55 @@ fn adjust_known_offsets<W: Write + CAIRead + ?Sized>(
             // num entries
             let num_entries = output.read_u32::<BigEndian>()?;
 
-            // get the moof boxes
-            // fix up the offsets in the entry list
-            for _entries in 0..num_entries {
-                if version == 1 {
-                    let _time = output.read_u64::<BigEndian>()?;
+            let field_size = if version == 1 { 8 } else { 4 };
+            let trailing_size =
+                (length_size_of_traf_num + length_size_of_trun_num + length_size_of_sample_num + 3)
+                    as usize;
+            let remaining = box_end.saturating_sub(output.stream_position()?);
+            if u64::from(num_entries) > remaining / (field_size * 2 + trailing_size as u64) {
+                return Err(Error::InvalidAsset(
+                    "Bad BMFF: tfra entries exceed box bounds".to_string(),
+                ));
+            }
 
-                    // write out mapped value of the moof position for this track
-                    let moof_offset = track_id_to_moof_mapping
-                        .get(&track_id)
-                        .ok_or(Error::InvalidAsset("Bad BMFF".to_string()))?;
-                    output.write_u64::<BigEndian>(*moof_offset)?;
+            // TFRA entries identify sync samples, not unique fragments. Preserve each
+            // entry's own target, including repeated references to the same moof.
+            for _ in 0..num_entries {
+                let mut time = [0u8; 8];
+                output.read_exact(&mut time[..field_size as usize])?;
+                let offset_pos = output.stream_position()?;
+                let old_offset = if version == 1 {
+                    output.read_u64::<BigEndian>()?
                 } else {
-                    let _time = output.read_u32::<BigEndian>()?;
+                    u64::from(output.read_u32::<BigEndian>()?)
+                };
+                let mut trailing = [0u8; 12];
+                output.read_exact(&mut trailing[..trailing_size])?;
+                let next_entry = output.stream_position()?;
 
-                    // write out mapped value of the moof position for this track
-                    let moof_offset_u64 = track_id_to_moof_mapping
-                        .get(&track_id)
-                        .ok_or(Error::InvalidAsset("Bad BMFF".to_string()))?;
-
-                    let moof_offset = u32::try_from(*moof_offset_u64).map_err(|_e| {
-                        Error::InvalidAsset("Bad BMFF offset adjustment".to_string())
-                    })?;
-                    output.write_u32::<BigEndian>(moof_offset)?;
+                // Field locations are from the output tree, but their targets still
+                // use original-file coordinates. Only surviving targets beyond the
+                // replaced region move; references into removed content are invalid.
+                if replaced.contains(&old_offset) {
+                    return Err(Error::InvalidAsset(
+                        "Bad BMFF: tfra target inside replaced content".to_string(),
+                    ));
                 }
-
-                // read extra stuff to move the position
-                let traf_num_bytes = length_size_of_traf_num + 1;
-                output.read_to_vec(traf_num_bytes as u64)?;
-                let trun_num_bytes = length_size_of_trun_num + 1;
-                output.read_to_vec(trun_num_bytes as u64)?;
-                let sample_num_bytes = length_size_of_sample_num + 1;
-                output.read_to_vec(sample_num_bytes as u64)?;
+                if old_offset >= replaced.end {
+                    let new_offset = old_offset.checked_add_signed(adjust).ok_or_else(|| {
+                        Error::InvalidAsset("Bad BMFF tfra offset adjustment".to_string())
+                    })?;
+                    output.seek(SeekFrom::Start(offset_pos))?;
+                    if version == 1 {
+                        output.write_u64::<BigEndian>(new_offset)?;
+                    } else {
+                        let new_offset = u32::try_from(new_offset).map_err(|_| {
+                            Error::InvalidAsset("Bad BMFF tfra offset adjustment".to_string())
+                        })?;
+                        output.write_u32::<BigEndian>(new_offset)?;
+                    }
+                    output.seek(SeekFrom::Start(next_entry))?;
+                }
             }
         }
     }
@@ -2563,14 +2589,9 @@ impl CAIWriter for BmffIO {
         output_stream.write_all(&new_c2pa_box)?;
 
         // calc offset adjustments
-        let offset_adjust: i32 = if end == 0 {
-            new_c2pa_box_size as i32
-        } else {
-            // value could be negative if box is truncated
-            let existing_c2pa_box_size = end - start;
-            let pad_size: i32 = new_c2pa_box_size as i32 - existing_c2pa_box_size as i32;
-            pad_size
-        };
+        let offset_adjust = i64::try_from(new_c2pa_box_size)
+            .and_then(|new| i64::try_from(end - start).map(|old| new - old))
+            .map_err(|_| Error::InvalidAsset("Bad BMFF offset adjustment".to_string()))?;
 
         // write content after ContentProvenanceBox
         // since we reached this point we must have an ordinary manifest store so we may need to truncate off
@@ -2587,7 +2608,8 @@ impl CAIWriter for BmffIO {
             std::io::copy(input_stream, output_stream)?;
         }
 
-        // Manipulating the UUID box means we may need some patch offsets if they are file absolute offsets.
+        // Same-size replacement needs no relocation. TFRA checks in the adjustment
+        // pass are not a general asset-validation pass and are skipped here at zero delta.
         if offset_adjust != 0 {
             if bmff_map.contains_key("/moov") && bmff_map.contains_key("/moof") {
                 relocate_single_file_fragments(
@@ -2633,6 +2655,7 @@ impl CAIWriter for BmffIO {
                 &output_bmff_tree,
                 &output_bmff_map,
                 offset_adjust,
+                start as u64..end as u64,
             )?;
         }
 
@@ -2725,9 +2748,8 @@ impl CAIWriter for BmffIO {
 
         // calc offset adjustments
         // value will be negative since the box is truncated
-        let new_c2pa_box_size: i32 = 0;
-        let existing_c2pa_box_size = end - start;
-        let offset_adjust = new_c2pa_box_size - existing_c2pa_box_size as i32;
+        let offset_adjust = -i64::try_from(end - start)
+            .map_err(|_| Error::InvalidAsset("Bad BMFF offset adjustment".to_string()))?;
 
         // write content after ContentProvenanceBox
         input_stream.seek(SeekFrom::Start(end as u64))?;
@@ -2779,6 +2801,7 @@ impl CAIWriter for BmffIO {
             &output_bmff_tree,
             &output_bmff_map,
             offset_adjust,
+            start as u64..end as u64,
         )
     }
 }
@@ -3014,14 +3037,9 @@ impl RemoteRefEmbed for BmffIO {
                 output_stream.write_all(&new_xmp_box)?;
 
                 // calc offset adjustments
-                let offset_adjust: i32 = if end == 0 {
-                    new_xmp_box_size as i32
-                } else {
-                    // value could be negative if box is truncated
-                    let existing_xmp_box_size = end - start;
-                    let pad_size: i32 = new_xmp_box_size as i32 - existing_xmp_box_size as i32;
-                    pad_size
-                };
+                let offset_adjust = i64::try_from(new_xmp_box_size)
+                    .and_then(|new| i64::try_from(end - start).map(|old| new - old))
+                    .map_err(|_| Error::InvalidAsset("Bad BMFF offset adjustment".to_string()))?;
 
                 // write content after XMP box
                 input_stream.seek(SeekFrom::Start(end as u64))?;
@@ -3073,6 +3091,7 @@ impl RemoteRefEmbed for BmffIO {
                     &output_bmff_tree,
                     &output_bmff_map,
                     offset_adjust,
+                    start as u64..end as u64,
                 )
             }
             crate::asset_io::RemoteRefEmbedType::StegoS(_) => Err(Error::UnsupportedType),
@@ -3166,7 +3185,8 @@ pub(crate) fn inject_placeholder(
     std::io::copy(input_stream, output_stream)?;
 
     // calc offset adjustments
-    let offset_adjust: i32 = free_box_bytes.len() as i32;
+    let offset_adjust = i64::try_from(free_box_bytes.len())
+        .map_err(|_| Error::InvalidAsset("Bad BMFF offset adjustment".to_string()))?;
 
     // Manipulating the free box means we may need some patch offsets if they are file absolute offsets.
     if offset_adjust != 0 {
@@ -3206,6 +3226,7 @@ pub(crate) fn inject_placeholder(
             &output_bmff_tree,
             &output_bmff_map,
             offset_adjust,
+            start..start,
         )?;
     }
 
@@ -3307,6 +3328,9 @@ pub enum BmffError {
     #[error("invalid file signature: {reason}")]
     InvalidFileSignature { reason: String },
 }
+
+#[cfg(test)]
+mod tfra_tests;
 
 #[cfg(test)]
 pub mod tests {
