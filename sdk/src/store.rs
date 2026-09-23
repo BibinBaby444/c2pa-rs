@@ -3429,6 +3429,7 @@ impl Store {
         if is_bmff {
             // 2) Get hash ranges if needed, do not generate for update manifests
             let mut needs_hash = false;
+            let mut single_file_fragments = false;
             if !pc.update_manifest() && pc.bmff_hash_assertions().is_empty() {
                 intermediate_stream.rewind()?;
                 let mut bmff_hash = Store::generate_bmff_data_hash_for_stream(pc.alg())?;
@@ -3437,12 +3438,26 @@ impl Store {
                     bmff_hash.set_bmff_version(2); // backcompat support
                 }
 
-                // add Merkle mdats if requested
-                Store::generate_bmff_mdat_hashes(
+                // Fragment binding takes precedence over ordinary mdat chunk hashing.
+                if let Some(fragment_boxes) = bmff_hash.prepare_single_file_merkle(
                     &mut intermediate_stream,
-                    &mut bmff_hash,
-                    settings,
-                )?;
+                    settings.core.merkle_tree_max_leaves,
+                )? {
+                    let mut temp_stream = io_utils::stream_with_fs_fallback(threshold);
+                    crate::asset_handlers::bmff_io::insert_fragment_merkle_boxes(
+                        &mut intermediate_stream,
+                        &mut temp_stream,
+                        &fragment_boxes,
+                    )?;
+                    intermediate_stream = temp_stream;
+                    single_file_fragments = true;
+                } else {
+                    Store::generate_bmff_mdat_hashes(
+                        &mut intermediate_stream,
+                        &mut bmff_hash,
+                        settings,
+                    )?;
+                }
 
                 // insert Merkle UUID boxes at the correct location if required
                 if let Some(merkle_uuid_boxes) = &bmff_hash.merkle_uuid_boxes {
@@ -3495,7 +3510,11 @@ impl Store {
                     output_stream.rewind()?;
                     let mut cb =
                         |step, total| context.check_progress(ProgressPhase::Hashing, step, total);
-                    bmff_hash.gen_hash_from_stream_with_progress(output_stream, &mut cb)?;
+                    if single_file_fragments {
+                        bmff_hash.finalize_single_file_merkle(output_stream, &mut cb)?;
+                    } else {
+                        bmff_hash.gen_hash_from_stream_with_progress(output_stream, &mut cb)?;
+                    }
                     pc.update_bmff_hash(bmff_hash)?;
                 }
             }
