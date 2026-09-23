@@ -85,7 +85,8 @@ impl C2paStream {
     /// * `flush` - a FlushCallback to flush the stream
     ///
     /// # Safety
-    /// The context must remain valid for the lifetime of the C2paStream.
+    /// The context must remain valid for the lifetime of the C2paStream, or may
+    /// be null if the callbacks do not require a context.
     ///
     /// The read, seek, and write callbacks must be valid for the lifetime of the C2paStream.
     ///
@@ -135,7 +136,7 @@ impl Read for C2paStream {
         }
 
         let bytes_read =
-            unsafe { (self.reader)(&mut (*self.context), buf.as_mut_ptr(), buf.len() as isize) };
+            unsafe { (self.reader)(self.context, buf.as_mut_ptr(), buf.len() as isize) };
 
         // Returns a negative number for errors.
         if bytes_read < 0 {
@@ -173,7 +174,7 @@ impl Seek for C2paStream {
             std::io::SeekFrom::End(pos) => (pos, C2paSeekMode::End),
         };
 
-        let new_pos = unsafe { (self.seeker)(&mut (*self.context), pos as isize, mode) };
+        let new_pos = unsafe { (self.seeker)(self.context, pos as isize, mode) };
         if new_pos < 0 {
             return Err(CimplError::last_message()
                 .map(|msg| {
@@ -207,7 +208,7 @@ impl Write for C2paStream {
             ));
         }
         let bytes_written =
-            unsafe { (self.writer)(&mut (*self.context), buf.as_ptr(), buf.len() as isize) };
+            unsafe { (self.writer)(self.context, buf.as_ptr(), buf.len() as isize) };
         if bytes_written < 0 {
             return Err(CimplError::last_message()
                 .map(|msg| {
@@ -228,7 +229,7 @@ impl Write for C2paStream {
     /// # Errors
     /// * Returns an error if the underlying C callback returns an error too (negative value)
     fn flush(&mut self) -> std::io::Result<()> {
-        let err = unsafe { (self.flusher)(&mut (*self.context)) };
+        let err = unsafe { (self.flusher)(self.context) };
         if err < 0 {
             return Err(std::io::Error::last_os_error());
         }
@@ -409,6 +410,49 @@ impl TestC2paStream {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_cstream_null_callback_context() {
+        unsafe extern "C" fn read(ctx: *mut StreamContext, _: *mut u8, _: isize) -> isize {
+            if ctx.is_null() {
+                0
+            } else {
+                -1
+            }
+        }
+        unsafe extern "C" fn seek(
+            ctx: *mut StreamContext,
+            offset: isize,
+            _: C2paSeekMode,
+        ) -> isize {
+            if ctx.is_null() {
+                offset
+            } else {
+                -1
+            }
+        }
+        unsafe extern "C" fn write(ctx: *mut StreamContext, _: *const u8, len: isize) -> isize {
+            if ctx.is_null() {
+                len
+            } else {
+                -1
+            }
+        }
+        unsafe extern "C" fn flush(ctx: *mut StreamContext) -> isize {
+            if ctx.is_null() {
+                0
+            } else {
+                -1
+            }
+        }
+
+        // Python callbacks capture their stream and pass a null opaque context.
+        let mut stream = unsafe { C2paStream::new(std::ptr::null_mut(), read, seek, write, flush) };
+        assert_eq!(stream.read(&mut [0; 1]).unwrap(), 0);
+        assert_eq!(stream.seek(SeekFrom::Start(3)).unwrap(), 3);
+        assert_eq!(stream.write(&[1, 2]).unwrap(), 2);
+        stream.flush().unwrap();
+    }
 
     #[test]
     fn test_cstream_read() {
