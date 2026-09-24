@@ -2339,6 +2339,35 @@ pub unsafe extern "C" fn c2pa_manifest_bytes_free(manifest_bytes_ptr: *const c_u
 /// # Returns
 ///
 /// The length of the manifest bytes on success, or `-1` on error.
+/// Expand `asset_path` as a glob and return the first signed init segment
+/// that c2pa-rs produced under `output_dir`.
+///
+/// Mirrors the output layout `Store::save_to_bmff_fragmented` writes:
+/// `<output_dir>/<init parent dir name>/<init file name>`. Returns `None`
+/// when the pattern is invalid or no expanded candidate exists on disk.
+#[cfg(feature = "file_io")]
+fn glob_signed_init_path(
+    asset_path: &std::path::Path,
+    output_dir: &std::path::Path,
+) -> Option<std::path::PathBuf> {
+    let pattern = asset_path.to_str()?;
+    for entry in glob::glob(pattern).ok()?.flatten() {
+        let dir_name = match entry.parent().and_then(|p| p.file_name()) {
+            Some(name) => name.to_owned(),
+            None => continue,
+        };
+        let file_name = match entry.file_name() {
+            Some(name) => name.to_owned(),
+            None => continue,
+        };
+        let candidate = output_dir.join(dir_name).join(file_name);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
 #[cfg(feature = "file_io")]
 #[no_mangle]
 pub unsafe extern "C" fn c2pa_builder_sign_fragmented(
@@ -2387,7 +2416,21 @@ pub unsafe extern "C" fn c2pa_builder_sign_fragmented(
             return -1;
         }
     };
-    let signed_init_path = output_dir_buf.join(&input_dir_name).join(&init_file_name);
+    // c2pa-rs globs `asset_path`, so a multi-rendition ladder pattern such as
+    // `<root>/*/init.m4s` expands to one init segment per rendition, each
+    // written to `<output_dir>/<its parent dir name>/<its file name>`. Joining
+    // the pattern's own components would look for a directory literally named
+    // `*`, so fall back to expanding the same glob and taking the first signed
+    // init that exists. Every rendition carries the identical manifest -- the
+    // whole set is covered by a single claim -- so any of them yields the bytes
+    // we return. Keep the literal join as the fallback so a genuinely missing
+    // single-rendition output still reports the original error below.
+    let literal_init_path = output_dir_buf.join(&input_dir_name).join(&init_file_name);
+    let signed_init_path = if literal_init_path.is_file() {
+        literal_init_path
+    } else {
+        glob_signed_init_path(&asset_path_buf, &output_dir_buf).unwrap_or(literal_init_path)
+    };
 
     // Read back the embedded JUMBF manifest bytes.
     let manifest_bytes = match c2pa::jumbf_io::load_jumbf_from_file(&signed_init_path) {
@@ -5690,5 +5733,62 @@ verify_after_sign = true
         assert_eq!(result, 0, "cancel should work on a built context");
 
         unsafe { c2pa_free(context as *mut c_void) };
+    }
+
+    #[cfg(feature = "file_io")]
+    #[test]
+    fn glob_signed_init_path_resolves_multi_rendition_ladder() {
+        // c2pa-rs expands a glob asset path into one init per rendition and
+        // writes each to <output_dir>/<its parent dir name>/<its file name>.
+        let input = tempfile::tempdir().unwrap();
+        let output = tempfile::tempdir().unwrap();
+        for rendition in ["1080p", "720p"] {
+            std::fs::create_dir(input.path().join(rendition)).unwrap();
+            std::fs::write(input.path().join(rendition).join("init.m4s"), b"in").unwrap();
+            std::fs::create_dir(output.path().join(rendition)).unwrap();
+            std::fs::write(output.path().join(rendition).join("init.m4s"), b"signed").unwrap();
+        }
+
+        let pattern = input.path().join("*").join("init.m4s");
+        let resolved = glob_signed_init_path(&pattern, output.path())
+            .expect("glob asset path should resolve to a signed init");
+
+        // Every rendition carries the same manifest, so any of them is a valid
+        // answer -- but it must be a real file under the output directory.
+        assert!(
+            resolved.is_file(),
+            "resolved path does not exist: {resolved:?}"
+        );
+        assert!(resolved.starts_with(output.path()));
+        assert_eq!(resolved.file_name().unwrap(), "init.m4s");
+    }
+
+    #[cfg(feature = "file_io")]
+    #[test]
+    fn glob_signed_init_path_resolves_a_literal_single_rendition_path() {
+        let input = tempfile::tempdir().unwrap();
+        let output = tempfile::tempdir().unwrap();
+        std::fs::create_dir(input.path().join("vod")).unwrap();
+        std::fs::write(input.path().join("vod").join("init.m4s"), b"in").unwrap();
+        std::fs::create_dir(output.path().join("vod")).unwrap();
+        std::fs::write(output.path().join("vod").join("init.m4s"), b"signed").unwrap();
+
+        let literal = input.path().join("vod").join("init.m4s");
+        let resolved = glob_signed_init_path(&literal, output.path()).unwrap();
+        assert_eq!(resolved, output.path().join("vod").join("init.m4s"));
+    }
+
+    #[cfg(feature = "file_io")]
+    #[test]
+    fn glob_signed_init_path_is_none_when_nothing_was_written() {
+        let input = tempfile::tempdir().unwrap();
+        let output = tempfile::tempdir().unwrap();
+        std::fs::create_dir(input.path().join("vod")).unwrap();
+        std::fs::write(input.path().join("vod").join("init.m4s"), b"in").unwrap();
+
+        // Output directory is empty: the caller falls back to the literal join
+        // so the original read-back error is what surfaces.
+        let pattern = input.path().join("*").join("init.m4s");
+        assert!(glob_signed_init_path(&pattern, output.path()).is_none());
     }
 }
