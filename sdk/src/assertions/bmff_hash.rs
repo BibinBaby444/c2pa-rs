@@ -1234,6 +1234,7 @@ impl BmffHash {
     /// single-file fragmented asset is an error rather than a fall-back to mdat
     /// chunk hashing: a ladder whose rungs are bound in different ways is not
     /// something the reader can select between.
+    #[cfg(feature = "file_io")]
     pub(crate) fn add_single_file_rendition(
         &mut self,
         reader: &mut dyn CAIRead,
