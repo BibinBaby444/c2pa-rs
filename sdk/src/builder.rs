@@ -3112,17 +3112,22 @@ impl Builder {
     /// the identical signed manifest is embedded in every destination, which is
     /// what lets a player switch rungs without leaving the manifest behind.
     ///
-    /// Note: this does not support sources that already carry a C2PA manifest,
-    /// and it adds no parent ingredient or thumbnail of its own -- a ladder has
-    /// no single source file to derive either from, so add them to the
-    /// definition if you want them.
+    /// A source that already carries a C2PA manifest is refused: a ladder adds
+    /// no parent ingredient (nor a thumbnail) of its own, having no single
+    /// source file to derive either from, so re-signing would silently replace
+    /// provenance. Add ingredients and thumbnails to the definition if you
+    /// want them.
     ///
     /// # Arguments
     /// * `signer` - The signer to use.
     /// * `sources` - One path per rendition. The order fixes each rendition's
     ///   `uniqueId`, so a set signed twice must be given in the same order.
-    /// * `dests` - One output path per rendition, in the same order. They must
-    ///   be distinct and must not name any of the sources.
+    /// * `dests` - One output path per rendition, in the same order. None may
+    ///   exist yet: unlike [`Self::sign_file`], nothing is overwritten -- every
+    ///   output is created with `create_new`, so a path that is a source,
+    ///   another output under any spelling or link, or any pre-existing file
+    ///   is an error. On any error, every output this call created is removed
+    ///   again, so a failed call leaves no partial ladder behind.
     ///
     /// # Returns
     /// * The bytes of the c2pa_manifest that was embedded in every rendition.

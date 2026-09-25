@@ -1248,6 +1248,16 @@ impl BmffHash {
                 "ladder renditions must be numbered in order: expected uniqueId {expected}, got {unique_id}"
             )));
         }
+        // A rendition that already carries a manifest would have that
+        // provenance replaced with no parent ingredient to say so; re-signing
+        // is not something a ladder does. (Existing Merkle boxes are refused
+        // by the layout below, but a whole-file binding has none.)
+        let existing = read_bmff_c2pa_boxes(reader)?;
+        if existing.manifest_box_offset.is_some() || existing.manifest_bytes.is_some() {
+            return Err(Error::BadParam(format!(
+                "rendition {unique_id} already carries a C2PA manifest; ladder signing does not re-sign an asset"
+            )));
+        }
         let Some((map, uuids)) = self.single_file_merkle_layout(reader, max_leaves, unique_id)?
         else {
             return Err(Error::BadParam(format!(

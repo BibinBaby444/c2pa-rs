@@ -3210,10 +3210,15 @@ impl Store {
     /// A one-rung ladder is exactly a single-asset signing: `uniqueId` 1 is
     /// [`SINGLE_RENDITION_ID`].
     ///
-    /// `outputs` must be the same length as `inputs`, must be distinct files,
-    /// and none may be an input -- judged by resolved path and, where the file
-    /// exists, by identity, so aliases and hard links are refused too. The
-    /// manifest is always embedded, so
+    /// `outputs` must be the same length as `inputs`, and none may exist yet:
+    /// every output is created with `create_new`, so a path that is a source,
+    /// another output under any spelling or link, or any other pre-existing
+    /// file is refused and nothing is ever overwritten. On any error, every
+    /// output this call created is removed again, so a failed call leaves no
+    /// partial ladder behind. No input may already carry a C2PA manifest: a
+    /// ladder signing adds no parent ingredient, so re-signing is refused
+    /// rather than silently replacing provenance. The manifest is always
+    /// embedded, so
     /// remote and sidecar manifests are refused. Returns the JUMBF manifest
     /// that was written to every rendition.
     #[cfg(feature = "file_io")]
@@ -3224,9 +3229,6 @@ impl Store {
         signer: &dyn Signer,
         context: &Context,
     ) -> Result<Vec<u8>> {
-        let settings = context.settings();
-        let threshold = settings.core.backing_store_memory_threshold_in_mb;
-
         if inputs.is_empty() {
             return Err(Error::BadParam(
                 "at least one rendition path must be provided".to_string(),
@@ -3249,78 +3251,7 @@ impl Store {
         }
         let format = get_supported_file_extension(&inputs[0]).ok_or(Error::UnsupportedType)?;
 
-        // Each rendition is read while its own output is written, and the
-        // outputs are patched again after signing, so they may not overlap.
-        // Overlap is a property of files, not of spellings: `sub/../x.mp4`
-        // IS `x.mp4`, and a hard link is a second name for one inode. So
-        // compare canonical paths -- an output need not exist yet, so its
-        // parent is canonicalized and the file name re-joined -- and, for
-        // anything that already exists, file identity.
-        {
-            fn canonical_output(path: &Path) -> Result<PathBuf> {
-                if path.exists() {
-                    return Ok(std::fs::canonicalize(path)?);
-                }
-                // `exists()` follows symlinks, so a dangling one looks like a
-                // fresh output while the write would land wherever it points
-                // -- possibly on another rendition's output.
-                if std::fs::symlink_metadata(path).is_ok() {
-                    return Err(Error::BadParam(format!(
-                        "output {} is a symlink to a file that does not exist",
-                        path.display()
-                    )));
-                }
-                let parent = match path.parent() {
-                    Some(p) if !p.as_os_str().is_empty() => p,
-                    _ => Path::new("."),
-                };
-                let name = path.file_name().ok_or_else(|| {
-                    Error::BadParam("an output path must name a file".to_string())
-                })?;
-                Ok(std::fs::canonicalize(parent)?.join(name))
-            }
-
-            let canonical_inputs = inputs
-                .iter()
-                .map(std::fs::canonicalize)
-                .collect::<std::io::Result<Vec<PathBuf>>>()?;
-            let input_handles = inputs
-                .iter()
-                .map(same_file::Handle::from_path)
-                .collect::<std::io::Result<Vec<_>>>()?;
-            let mut destinations: HashSet<PathBuf> = HashSet::new();
-            let mut destination_handles: Vec<same_file::Handle> = Vec::new();
-            for output in outputs {
-                let canonical = canonical_output(output)?;
-                if !destinations.insert(canonical.clone()) {
-                    return Err(Error::BadParam(
-                        "every rendition needs its own output path".to_string(),
-                    ));
-                }
-                if canonical_inputs.contains(&canonical) {
-                    return Err(Error::BadParam(
-                        "a rendition's output path must not be any rendition's input".to_string(),
-                    ));
-                }
-                if output.exists() {
-                    let handle = same_file::Handle::from_path(output)?;
-                    if input_handles.contains(&handle) {
-                        return Err(Error::BadParam(
-                        "a rendition's output is the same file as a rendition's input (a hard link)"
-                            .to_string(),
-                    ));
-                    }
-                    if destination_handles.contains(&handle) {
-                        return Err(Error::BadParam(
-                            "two renditions' outputs are the same file (hard links of one another)"
-                                .to_string(),
-                        ));
-                    }
-                    destination_handles.push(handle);
-                }
-            }
-        }
-
+        // Claim-level refusals come first: they need no output created.
         {
             let pc = self.provenance_claim().ok_or(Error::ClaimEncoding)?;
             // The manifest box is excluded from initHash and the leaf hashes; what
@@ -3343,6 +3274,73 @@ impl Store {
                 ));
             }
         }
+
+        // Every output is created here, up front and with `create_new`, so the
+        // filesystem decides overlap rather than string comparison: an output
+        // that already exists -- a source, a hard link or symlink to a source
+        // or to another output, a dangling symlink (`create_new` does not
+        // follow one on Unix), a case-folded twin of an output created a
+        // moment ago on a case-insensitive filesystem, or any other
+        // pre-existing file -- is refused, and nothing that existed
+        // before this call is ever truncated. From here on any failure removes
+        // every output this call created, so a failed call leaves no partial
+        // ladder behind.
+        let reserved = Store::reserve_ladder_outputs(outputs)?;
+        let result = self.write_bmff_ladder(inputs, reserved, outputs, &format, signer, context);
+        if result.is_err() {
+            for output in outputs {
+                let _ = std::fs::remove_file(output);
+            }
+        }
+        result
+    }
+
+    /// Create every ladder output with `create_new`, in order. If one is
+    /// refused, the ones already created are removed again.
+    #[cfg(feature = "file_io")]
+    fn reserve_ladder_outputs(outputs: &[PathBuf]) -> Result<Vec<std::fs::File>> {
+        let mut reserved = Vec::with_capacity(outputs.len());
+        for (index, output) in outputs.iter().enumerate() {
+            match std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(output)
+            {
+                Ok(file) => reserved.push(file),
+                Err(e) => {
+                    drop(reserved);
+                    for created in &outputs[..index] {
+                        let _ = std::fs::remove_file(created);
+                    }
+                    return Err(if e.kind() == std::io::ErrorKind::AlreadyExists {
+                        Error::BadParam(format!(
+                            "output {} already exists; ladder signing never overwrites, and an output may not be a source, another output, or a link to either",
+                            output.display()
+                        ))
+                    } else {
+                        Error::IoError(e)
+                    });
+                }
+            }
+        }
+        Ok(reserved)
+    }
+
+    /// The body of [`Self::save_to_bmff_ladder`], once every output has been
+    /// reserved: `reserved[i]` is the open, empty file at `outputs[i]`.
+    #[cfg(feature = "file_io")]
+    fn write_bmff_ladder(
+        &mut self,
+        inputs: &[PathBuf],
+        mut reserved: Vec<std::fs::File>,
+        outputs: &[PathBuf],
+        format: &str,
+        signer: &dyn Signer,
+        context: &Context,
+    ) -> Result<Vec<u8>> {
+        let settings = context.settings();
+        let threshold = settings.core.backing_store_memory_threshold_in_mb;
 
         // Dynamic assertions need their placeholders in the claim before the
         // manifest length is fixed.
@@ -3377,12 +3375,7 @@ impl Store {
         //    leaf hashes cover absolute offsets, so they are only correct once
         //    the UUID boxes and the manifest are at their final positions.
         let unsigned_jumbf = self.to_jumbf_internal(signer.reserve_size())?;
-        for (index, ((input, output), boxes)) in inputs
-            .iter()
-            .zip(outputs.iter())
-            .zip(merkle_boxes.iter())
-            .enumerate()
-        {
+        for (index, (input, boxes)) in inputs.iter().zip(merkle_boxes.iter()).enumerate() {
             // Rendition ids are 1-based, matching what pass 1 recorded.
             let unique_id = index + 1;
             context.check_progress(
@@ -3400,19 +3393,18 @@ impl Store {
             )?;
             with_boxes.rewind()?;
 
-            let mut dest = std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .open(output)?;
-            save_jumbf_to_stream(&format, &mut with_boxes, &mut dest, &unsigned_jumbf)?;
+            let dest = &mut reserved[index];
+            save_jumbf_to_stream(format, &mut with_boxes, dest, &unsigned_jumbf)?;
             drop(with_boxes); // one rendition-sized temporary at a time
 
             dest.rewind()?;
             let mut cb = |step, total| context.check_progress(ProgressPhase::Hashing, step, total);
-            bmff_hash.finalize_single_file_merkle(&mut dest, unique_id, &mut cb)?;
+            bmff_hash.finalize_single_file_merkle(dest, unique_id, &mut cb)?;
         }
+        // The patch below and the verification reopen by path. Before each
+        // reopen, check that the path still names the file that was reserved
+        // and written -- a swap in the output directory would otherwise
+        // receive the patch. The handles are dropped only afterwards.
 
         // 3) Fold every rendition's hashes back into the one assertion.
         let pc = self.provenance_claim_mut().ok_or(Error::ClaimEncoding)?;
@@ -3463,9 +3455,17 @@ impl Store {
         //    would silently invalidate every initHash and leaf hash just
         //    computed against the patched layout, so the fallback must be
         //    unreachable and a patch failure must surface.
-        for output in outputs {
+        for (output, reserved) in outputs.iter().zip(reserved.iter()) {
+            let expected = same_file::Handle::from_file(reserved.try_clone()?)?;
+            if same_file::Handle::from_path(output)? != expected {
+                return Err(Error::BadParam(format!(
+                    "output {} was replaced while the ladder was being signed",
+                    output.display()
+                )));
+            }
             Store::patch_manifest_in_place(output, &final_jumbf)?;
         }
+        drop(reserved);
 
         context.check_progress(ProgressPhase::Embedding, 1, 1)?;
 
@@ -3476,7 +3476,7 @@ impl Store {
                     StatusTracker::with_error_behavior(ErrorBehavior::StopOnFirstError);
                 Store::verify_store(
                     self,
-                    &mut ClaimAssetData::Stream(&mut dest, &format),
+                    &mut ClaimAssetData::Stream(&mut dest, format),
                     &mut validation_log,
                     context,
                 )?;

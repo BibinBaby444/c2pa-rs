@@ -386,20 +386,21 @@ fn ladder_rejects_mixed_and_overlapping_input() {
     let error = fail(&[multiplexed_path], std::slice::from_ref(&out_a));
     assert!(error.contains("multiplexed/changing tracks"), "{error}");
 
-    // An output may not be an input, or another rendition's output.
+    // An output may not be an input, or another rendition's output. (Both
+    // are "already exists" to the reservation; the identity cases live in
+    // ladder_never_overwrites_an_existing_file.)
     let error = fail(
         std::slice::from_ref(&fragmented),
         std::slice::from_ref(&fragmented),
     );
-    assert!(
-        error.contains("must not be any rendition's input"),
-        "{error}"
-    );
+    assert!(error.contains("already exists"), "{error}");
+    assert_eq!(std::fs::read(&fragmented).unwrap(), RELATIVE);
     let error = fail(
         &[fragmented.clone(), fragmented.clone()],
         &[out_a.clone(), out_a.clone()],
     );
-    assert!(error.contains("its own output path"), "{error}");
+    assert!(error.contains("already exists"), "{error}");
+    assert!(!out_a.exists(), "the first reservation was not taken back");
     let error = fail(
         std::slice::from_ref(&fragmented),
         &[out_a.clone(), out_b.clone()],
@@ -433,14 +434,15 @@ fn ladder_rejects_mixed_and_overlapping_input() {
         );
     }
 
-    // Re-signing an already bound rendition is still refused.
+    // Re-signing an already bound rendition is still refused -- now on the
+    // manifest itself, before the Merkle boxes would have been.
     let signed = sign_ladder(&[RELATIVE.to_vec()]);
     let error = fail(&[signed.outputs[0].clone()], std::slice::from_ref(&out_b));
-    assert!(error.contains("existing Merkle boxes"), "{error}");
+    assert!(error.contains("already carries a C2PA manifest"), "{error}");
 }
 
 #[test]
-fn ladder_rejects_overlap_by_file_identity_not_by_spelling() {
+fn ladder_never_overwrites_an_existing_file() {
     let dir = tempfile::tempdir().unwrap();
     let subdir = dir.path().join("subdir");
     std::fs::create_dir(&subdir).unwrap();
@@ -452,76 +454,82 @@ fn ladder_rejects_overlap_by_file_identity_not_by_spelling() {
     let untouched = |path: &PathBuf, seed: u8| {
         assert_eq!(std::fs::read(path).unwrap(), rendition(RELATIVE, seed));
     };
+    let out_b = || dir.path().join("out_b.mp4");
 
     let fail = |sources: &[PathBuf], outputs: &[PathBuf]| -> String {
-        builder()
+        let error = builder()
             .sign_ladder_files(test_signer(SigningAlg::Es256).as_ref(), sources, outputs)
             .unwrap_err()
-            .to_string()
+            .to_string();
+        assert!(error.contains("already exists"), "{error}");
+        error
     };
 
-    // `subdir/../a.mp4` is a different string but the same file as `a.mp4`:
-    // a spelling check lets the writer read a rendition while truncating it.
-    let alias_of_a = subdir.join("..").join("a.mp4");
-    let error = fail(&sources, &[alias_of_a, dir.path().join("out_b.mp4")]);
-    assert!(
-        error.contains("must not be any rendition's input"),
-        "{error}"
-    );
+    // Outputs are created with `create_new`, so overlap is decided by the
+    // filesystem rather than by comparing spellings. `subdir/../a.mp4` is a
+    // different string but the same file as the source `a.mp4`...
+    fail(&sources, &[subdir.join("..").join("a.mp4"), out_b()]);
     untouched(&source_a, 1);
-
-    // The other rendition's input, aliased, is just as much an input.
-    let alias_of_b = subdir.join("..").join("b.mp4");
-    let error = fail(&sources, &[alias_of_b, dir.path().join("out_b.mp4")]);
-    assert!(
-        error.contains("must not be any rendition's input"),
-        "{error}"
-    );
-    untouched(&source_b, 2);
-
-    // A hard link is a second name for the source's inode, and no amount of
-    // path comparison sees through it.
+    // ...and a hard link is a second name for the source's inode.
     let link_of_a = dir.path().join("link_of_a.mp4");
     std::fs::hard_link(&source_a, &link_of_a).unwrap();
-    let error = fail(&sources, &[link_of_a, dir.path().join("out_b.mp4")]);
-    assert!(
-        error.contains("same file as a rendition's input"),
-        "{error}"
-    );
+    fail(&sources, &[link_of_a.clone(), out_b()]);
     untouched(&source_a, 1);
+    untouched(&link_of_a, 1);
 
-    // Two spellings of one output would collapse the ladder into one file.
+    // Two spellings of one output would collapse the ladder into one file:
+    // the second reservation is refused, and the first is taken back.
     let out = dir.path().join("out.mp4");
-    let error = fail(&sources, &[out.clone(), subdir.join("..").join("out.mp4")]);
-    assert!(
-        error.contains("every rendition needs its own output path"),
-        "{error}"
-    );
+    fail(&sources, &[out.clone(), subdir.join("..").join("out.mp4")]);
+    assert!(!out.exists(), "a refused call left its first output behind");
 
-    // ...as would two outputs that are hard links of one another.
+    // A refused call takes back only what it created: pre-existing files
+    // -- here two hard-linked placeholders -- are neither truncated nor
+    // removed.
     let out_x = dir.path().join("x.mp4");
-    std::fs::write(&out_x, b"").unwrap();
+    std::fs::write(&out_x, b"placeholder").unwrap();
     let out_y = dir.path().join("y.mp4");
     std::fs::hard_link(&out_x, &out_y).unwrap();
-    let error = fail(&sources, &[out_x, out_y]);
-    assert!(error.contains("hard links of one another"), "{error}");
+    fail(&sources, &[out_x.clone(), out_y.clone()]);
+    assert_eq!(std::fs::read(&out_x).unwrap(), b"placeholder");
+    assert_eq!(std::fs::read(&out_y).unwrap(), b"placeholder");
 
     // A dangling symlink named like an output would send the write to its
-    // target -- here the other rendition's output, collapsing the ladder.
+    // target; `create_new` does not follow it.
     #[cfg(unix)]
     {
-        let out_y = dir.path().join("dangling_target.mp4");
-        let out_x = dir.path().join("dangling.mp4");
-        std::os::unix::fs::symlink(&out_y, &out_x).unwrap();
-        let error = fail(&sources, &[out_x, out_y]);
+        let target = dir.path().join("dangling_target.mp4");
+        let link = dir.path().join("dangling.mp4");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        fail(&sources, &[link.clone(), out_b()]);
+        assert!(!target.exists());
         assert!(
-            error.contains("symlink to a file that does not exist"),
-            "{error}"
+            link.symlink_metadata().is_ok(),
+            "the link itself was removed"
         );
     }
 
-    // The checks resolve, they do not forbid, relative spellings: an output
-    // that only does not exist yet is fine when named through `..`.
+    // A failure after reservation -- here rendition 2 is not fragmented --
+    // removes every output the call created.
+    let flat = dir.path().join("flat.mp4");
+    std::fs::write(&flat, FLAT).unwrap();
+    let error = builder()
+        .sign_ladder_files(
+            test_signer(SigningAlg::Es256).as_ref(),
+            &[source_a.clone(), flat],
+            &[dir.path().join("half_a.mp4"), dir.path().join("half_b.mp4")],
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("not a single-file fragmented BMFF"),
+        "{error}"
+    );
+    assert!(!dir.path().join("half_a.mp4").exists());
+    assert!(!dir.path().join("half_b.mp4").exists());
+
+    // The reservation resolves, it does not forbid, relative spellings: an
+    // output that only does not exist yet is fine when named through `..`.
     let fresh = subdir.join("..").join("fresh_a.mp4");
     builder()
         .sign_ladder_files(
@@ -539,6 +547,47 @@ fn ladder_rejects_overlap_by_file_identity_not_by_spelling() {
     );
     untouched(&source_a, 1);
     untouched(&source_b, 2);
+}
+
+#[test]
+fn ladder_rejects_a_rendition_that_already_carries_a_manifest() {
+    // A single-file fragmented asset with a manifest but no Merkle boxes: the
+    // shape a historical whole-file binding leaves behind. Re-signing it in a
+    // ladder would replace that provenance with no parent ingredient.
+    let manifest = sign_ladder(&[RELATIVE.to_vec()]).manifest;
+    let mut with_manifest = Cursor::new(Vec::new());
+    crate::jumbf_io::save_jumbf_to_stream(
+        "mp4",
+        &mut Cursor::new(RELATIVE),
+        &mut with_manifest,
+        &manifest,
+    )
+    .unwrap();
+    let with_manifest = with_manifest.into_inner();
+    assert!(read_bmff_c2pa_boxes(&mut Cursor::new(&with_manifest))
+        .unwrap()
+        .bmff_merkle
+        .is_empty());
+
+    let dir = tempfile::tempdir().unwrap();
+    let clean = dir.path().join("clean.mp4");
+    std::fs::write(&clean, rendition(RELATIVE, 1)).unwrap();
+    let signed_before = dir.path().join("signed_before.mp4");
+    std::fs::write(&signed_before, &with_manifest).unwrap();
+
+    let error = builder()
+        .sign_ladder_files(
+            test_signer(SigningAlg::Es256).as_ref(),
+            &[clean, signed_before],
+            &[dir.path().join("out1.mp4"), dir.path().join("out2.mp4")],
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("rendition 2 already carries a C2PA manifest"),
+        "{error}"
+    );
+    assert!(!dir.path().join("out1.mp4").exists());
 }
 
 struct DynamicSigner(Box<dyn Signer>);

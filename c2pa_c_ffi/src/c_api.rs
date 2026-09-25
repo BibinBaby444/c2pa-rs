@@ -2305,6 +2305,11 @@ pub unsafe extern "C" fn c2pa_manifest_bytes_free(manifest_bytes_ptr: *const c_u
     cimpl_free!(manifest_bytes_ptr);
 }
 
+/// More renditions than any real ladder has; bounds the array walk in
+/// [`c2pa_builder_sign_ladder`] before anything is allocated for it.
+#[cfg(feature = "file_io")]
+const MAX_LADDER_RENDITIONS: usize = 1024;
+
 /// Sign an ABR ladder of single-file fragmented BMFF assets into ONE manifest.
 ///
 /// Every rendition of a ladder shares one claim: the assertion carries one
@@ -2321,8 +2326,12 @@ pub unsafe extern "C" fn c2pa_manifest_bytes_free(manifest_bytes_ptr: *const c_u
 ///   rendition. Each must be a single-file fragmented BMFF (its own `moov`
 ///   and `moof`); a multiplexed or non-fragmented asset is rejected.
 /// * `dests` - array of `count` null-terminated UTF-8 output paths, positionally
-///   matched to `sources`. Must be distinct and must not alias a source.
-/// * `count` - number of renditions; must be greater than zero.
+///   matched to `sources`. None may exist yet: each is created with
+///   `create_new`, so a source, another output under any spelling or link, or
+///   any pre-existing file is refused and nothing is overwritten. On error,
+///   every output this call created is removed again. A source that already
+///   carries a C2PA manifest is refused.
+/// * `count` - number of renditions; 1 to 1024.
 /// * `manifest_bytes_ptr` - out-pointer receiving the manifest embedded in
 ///   every rendition. Released with [`c2pa_free`].
 ///
@@ -2351,6 +2360,13 @@ pub unsafe extern "C" fn c2pa_builder_sign_ladder(
 
     if count == 0 {
         CimplError::other("a ladder needs at least one rendition").set_last();
+        return -1;
+    }
+    if count > MAX_LADDER_RENDITIONS {
+        CimplError::other(format!(
+            "count {count} exceeds the {MAX_LADDER_RENDITIONS} renditions a ladder may hold"
+        ))
+        .set_last();
         return -1;
     }
     if sources.is_null() || dests.is_null() {
