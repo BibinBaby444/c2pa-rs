@@ -590,6 +590,178 @@ fn ladder_rejects_a_rendition_that_already_carries_a_manifest() {
     assert!(!dir.path().join("out1.mp4").exists());
 }
 
+/// `input` with every track-id field rewritten to `id`: tkhd, trex, each
+/// moof's tfhd, sidx and tfra. Distinct track ids across a ladder are the
+/// exception (a demuxed source renumbers everything to 1), but they must
+/// bind as `localId` and select correctly when they occur.
+fn with_track_id(input: &[u8], id: u32) -> Vec<u8> {
+    let mut data = input.to_vec();
+    let root = roots(&data);
+    let child = |data: &[u8], b: B, kind: &[u8; 4]| -> B {
+        let mut at = b.payload;
+        while at < b.end {
+            let size = u32::from_be_bytes(data[at..at + 4].try_into().unwrap()) as usize;
+            if &data[at + 4..at + 8] == kind {
+                return B {
+                    kind: *kind,
+                    start: at,
+                    payload: at + 8,
+                    end: at + size,
+                };
+            }
+            at += size;
+        }
+        panic!("no {} box", String::from_utf8_lossy(kind));
+    };
+    let moov = *root.iter().find(|b| b.kind == *b"moov").unwrap();
+    let trak = child(&data, moov, b"trak");
+    let tkhd = child(&data, trak, b"tkhd");
+    data[tkhd.payload + 12..tkhd.payload + 16].copy_from_slice(&id.to_be_bytes());
+    let trex = child(&data, child(&data, moov, b"mvex"), b"trex");
+    data[trex.payload + 4..trex.payload + 8].copy_from_slice(&id.to_be_bytes());
+    for moof in root.iter().filter(|b| b.kind == *b"moof") {
+        let tfhd = child(&data, child(&data, *moof, b"traf"), b"tfhd");
+        data[tfhd.payload + 4..tfhd.payload + 8].copy_from_slice(&id.to_be_bytes());
+    }
+    for kind in [b"sidx", b"mfra"] {
+        if let Some(b) = root.iter().find(|b| b.kind == *kind) {
+            let target = if kind == b"mfra" {
+                child(&data, *b, b"tfra")
+            } else {
+                *b
+            };
+            data[target.payload + 4..target.payload + 8].copy_from_slice(&id.to_be_bytes());
+        }
+    }
+    data
+}
+
+/// `RELATIVE`'s initialization prefix followed by `count` copies of its
+/// first fragment with advancing sequence numbers and decode times, and no
+/// sidx/mfra so every offset stays moof-relative.
+fn with_fragment_count(count: usize) -> Vec<u8> {
+    let root = roots(RELATIVE);
+    let moov = *root.iter().find(|b| b.kind == *b"moov").unwrap();
+    let first = *root.iter().find(|b| b.kind == *b"moof").unwrap();
+    let mdat = *root
+        .iter()
+        .find(|b| b.kind == *b"mdat" && b.start > first.start)
+        .unwrap();
+    let find = |data: &[u8], b: B, kind: &[u8; 4]| -> usize {
+        let mut at = b.payload;
+        while at < b.end {
+            let size = u32::from_be_bytes(data[at..at + 4].try_into().unwrap()) as usize;
+            if &data[at + 4..at + 8] == kind {
+                return at + 8;
+            }
+            at += size;
+        }
+        panic!("no {} box", String::from_utf8_lossy(kind));
+    };
+    let mfhd = find(RELATIVE, first, b"mfhd");
+    let traf = B {
+        kind: *b"traf",
+        start: 0,
+        payload: find(RELATIVE, first, b"traf"),
+        end: first.end,
+    };
+    let tfdt = find(RELATIVE, traf, b"tfdt");
+    let mut data = RELATIVE[..moov.end].to_vec();
+    for index in 0..count {
+        let mut fragment = RELATIVE[first.start..mdat.end].to_vec();
+        let at = mfhd + 4 - first.start;
+        fragment[at..at + 4].copy_from_slice(&((index + 1) as u32).to_be_bytes());
+        let at = tfdt + 4 - first.start;
+        fragment[at..at + 8].copy_from_slice(&(index as u64 * 2).to_be_bytes());
+        data.extend(fragment);
+    }
+    data
+}
+
+#[test]
+fn ladder_binds_unequal_fragment_counts_and_distinct_track_ids() {
+    // Rendition 1: the fixture as is (three fragments, track 1).
+    // Rendition 2: five fragments, track 1. Rendition 3: three fragments,
+    // track 7. The reader selects by (uniqueId, localId), so every output
+    // must validate against its own map and no other.
+    let renditions = vec![
+        RELATIVE.to_vec(),
+        with_fragment_count(5),
+        with_track_id(RELATIVE, 7),
+    ];
+    let signed = sign_ladder(&renditions);
+    for (index, output) in signed.outputs.iter().enumerate() {
+        let data = std::fs::read(output).unwrap();
+        let hash = binding(&data);
+        let maps = maps(&hash);
+        assert_eq!(maps.len(), 3);
+        assert_eq!(
+            maps.iter()
+                .map(|m| (m.unique_id, m.local_id, m.count))
+                .collect::<Vec<_>>(),
+            vec![(1, 1, 3), (2, 1, 5), (3, 7, 3)],
+            "rendition {}",
+            index + 1
+        );
+        let own = read_bmff_c2pa_boxes(&mut Cursor::new(&data))
+            .unwrap()
+            .bmff_merkle;
+        assert!(own
+            .iter()
+            .all(|b| b.unique_id == index + 1 && b.local_id == maps[index].local_id));
+        assert_eq!(own.len(), maps[index].count);
+    }
+}
+
+/// A signer that fails at the signature itself: everything up to that point
+/// -- reservation, boxes, placeholder manifest, hashing -- has happened.
+struct FailingSigner(Box<dyn Signer>);
+impl Signer for FailingSigner {
+    fn sign(&self, _: &[u8]) -> Result<Vec<u8>> {
+        Err(crate::Error::OtherError("the HSM is on fire".into()))
+    }
+    fn alg(&self) -> SigningAlg {
+        self.0.alg()
+    }
+    fn certs(&self) -> Result<Vec<Vec<u8>>> {
+        self.0.certs()
+    }
+    fn reserve_size(&self) -> usize {
+        self.0.reserve_size()
+    }
+}
+
+#[test]
+fn ladder_leaves_nothing_behind_when_signing_itself_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    let sources: Vec<PathBuf> = ladder()
+        .iter()
+        .enumerate()
+        .map(|(i, data)| {
+            let p = dir.path().join(format!("r{i}.mp4"));
+            std::fs::write(&p, data).unwrap();
+            p
+        })
+        .collect();
+    let outputs: Vec<PathBuf> = (0..sources.len())
+        .map(|i| dir.path().join(format!("s{i}.mp4")))
+        .collect();
+    let error = builder()
+        .sign_ladder_files(
+            &FailingSigner(test_signer(SigningAlg::Es256)),
+            &sources,
+            &outputs,
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("on fire"), "{error}");
+    for output in &outputs {
+        assert!(!output.exists(), "{} was left behind", output.display());
+    }
+    for (source, data) in sources.iter().zip(ladder()) {
+        assert_eq!(std::fs::read(source).unwrap(), data);
+    }
+}
+
 struct DynamicSigner(Box<dyn Signer>);
 struct Dynamic;
 impl DynamicAssertion for Dynamic {

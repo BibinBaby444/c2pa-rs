@@ -3450,6 +3450,133 @@ mod tests {
         };
     }
 
+    #[cfg(feature = "file_io")]
+    fn ladder_last_error() -> String {
+        let ptr = unsafe { c2pa_error() };
+        if ptr.is_null() {
+            return String::new();
+        }
+        let s = unsafe { std::ffi::CStr::from_ptr(ptr) }
+            .to_string_lossy()
+            .into_owned();
+        unsafe { c2pa_string_free(ptr) };
+        s
+    }
+
+    /// Call `c2pa_builder_sign_ladder` with the given paths and return
+    /// `(result, manifest bytes)`; the native buffer is released here.
+    #[cfg(feature = "file_io")]
+    unsafe fn call_sign_ladder(
+        builder: *mut C2paBuilder,
+        signer: *mut C2paSigner,
+        sources: &[std::path::PathBuf],
+        dests: &[std::path::PathBuf],
+        count: usize,
+    ) -> (i64, Vec<u8>) {
+        let sources: Vec<CString> = sources
+            .iter()
+            .map(|p| CString::new(p.to_str().unwrap()).unwrap())
+            .collect();
+        let dests: Vec<CString> = dests
+            .iter()
+            .map(|p| CString::new(p.to_str().unwrap()).unwrap())
+            .collect();
+        let source_ptrs: Vec<*const c_char> = sources.iter().map(|s| s.as_ptr()).collect();
+        let dest_ptrs: Vec<*const c_char> = dests.iter().map(|s| s.as_ptr()).collect();
+        let mut manifest: *const c_uchar = std::ptr::null();
+        let result = c2pa_builder_sign_ladder(
+            builder,
+            signer,
+            source_ptrs.as_ptr(),
+            dest_ptrs.as_ptr(),
+            count,
+            &mut manifest,
+        );
+        let bytes = if result > 0 {
+            let bytes = std::slice::from_raw_parts(manifest, result as usize).to_vec();
+            c2pa_free(manifest as *const c_void);
+            bytes
+        } else {
+            assert!(manifest.is_null());
+            Vec::new()
+        };
+        (result, bytes)
+    }
+
+    /// The ladder writer through the C entry point: the bytes handed back are
+    /// the bytes embedded in every output, the builder is borrowed and signs
+    /// again afterwards, and every refusal returns -1 with nothing written.
+    #[test]
+    #[cfg(feature = "file_io")]
+    fn sign_ladder_through_the_c_api() {
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = include_bytes!(fixture_path!("single_file_fragments.mp4"));
+        let a = dir.path().join("a.mp4");
+        std::fs::write(&a, fixture).unwrap();
+        let b = dir.path().join("b.mp4");
+        std::fs::write(&b, fixture).unwrap();
+        let sources = [a.clone(), b.clone()];
+        let outputs = [dir.path().join("out_a.mp4"), dir.path().join("out_b.mp4")];
+
+        let (signer, builder) = setup_signer_and_builder_for_signing_tests();
+        let (len, returned) = unsafe { call_sign_ladder(builder, signer, &sources, &outputs, 2) };
+        assert!(len > 0, "sign_ladder failed: {}", ladder_last_error());
+        for output in &outputs {
+            let embedded = c2pa::jumbf_io::load_jumbf_from_file(output).unwrap();
+            assert_eq!(embedded, returned, "{}", output.display());
+        }
+
+        // Borrowed, not consumed: the same builder signs a second ladder.
+        let again = [
+            dir.path().join("again_a.mp4"),
+            dir.path().join("again_b.mp4"),
+        ];
+        let (len, _) = unsafe { call_sign_ladder(builder, signer, &sources, &again, 2) };
+        assert!(len > 0, "second sign failed: {}", ladder_last_error());
+
+        // Refusals: an existing output, a zero count, an absurd count, and a
+        // source that is not fragmented -- each -1, each leaving no output.
+        let fresh = [dir.path().join("x.mp4"), dir.path().join("y.mp4")];
+        let (len, _) = unsafe {
+            call_sign_ladder(
+                builder,
+                signer,
+                &sources,
+                &[outputs[0].clone(), fresh[1].clone()],
+                2,
+            )
+        };
+        assert_eq!(len, -1);
+        assert!(ladder_last_error().contains("already exists"));
+        assert!(!fresh[1].exists());
+        let (len, _) = unsafe { call_sign_ladder(builder, signer, &sources, &fresh, 0) };
+        assert_eq!(len, -1);
+        assert!(
+            ladder_last_error().contains("greater than zero") || !ladder_last_error().is_empty()
+        );
+        let (len, _) = unsafe { call_sign_ladder(builder, signer, &sources, &fresh, 1025) };
+        assert_eq!(len, -1);
+        assert!(ladder_last_error().contains("exceeds the 1024"));
+        let flat = dir.path().join("flat.mp4");
+        std::fs::write(
+            &flat,
+            include_bytes!(fixture_path!("video1_no_manifest.mp4")),
+        )
+        .unwrap();
+        let (len, _) = unsafe { call_sign_ladder(builder, signer, &[a.clone(), flat], &fresh, 2) };
+        assert_eq!(len, -1);
+        assert!(ladder_last_error().contains("not a single-file fragmented BMFF"));
+        assert!(!fresh[0].exists() && !fresh[1].exists());
+
+        // Still usable after every refusal.
+        let last = [dir.path().join("last_a.mp4"), dir.path().join("last_b.mp4")];
+        let (len, _) = unsafe { call_sign_ladder(builder, signer, &sources, &last, 2) };
+        assert!(len > 0, "{}", ladder_last_error());
+
+        unsafe { c2pa_builder_free(builder) };
+        unsafe { c2pa_signer_free(signer) };
+    }
+
     /// Helper to create a signer and builder for testing
     /// Returns (signer, builder)
     fn setup_signer_and_builder_for_signing_tests() -> (*mut C2paSigner, *mut C2paBuilder) {

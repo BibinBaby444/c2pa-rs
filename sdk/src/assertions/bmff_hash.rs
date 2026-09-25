@@ -1241,7 +1241,8 @@ impl BmffHash {
         max_leaves: usize,
         unique_id: usize,
     ) -> crate::Result<Vec<Vec<u8>>> {
-        // 1-based per the specification, matching the multi-file writer.
+        // 1-based, matching the multi-file writer (the spec's CDDL comment
+        // calls the id 1-based; that comment is non-normative).
         let expected = self.merkle.as_ref().map_or(0, |maps| maps.len()) + 1;
         if unique_id != expected {
             return Err(Error::BadParam(format!(

@@ -3754,8 +3754,8 @@ impl Store {
 
                 // Fragment binding takes precedence over ordinary mdat chunk hashing.
                 //
-                // `uniqueId` is 1-based per the specification, matching the
-                // multi-file writer. A ladder numbers its renditions 1..N, so
+                // `uniqueId` is 1-based, matching the multi-file writer (the
+                // spec's CDDL comment, which is non-normative, calls it so). A ladder numbers its renditions 1..N, so
                 // a one-rung ladder is identical to signing that rendition on
                 // its own.
                 if let Some(fragment_boxes) = bmff_hash.prepare_single_file_merkle(
