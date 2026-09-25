@@ -2305,40 +2305,6 @@ pub unsafe extern "C" fn c2pa_manifest_bytes_free(manifest_bytes_ptr: *const c_u
     cimpl_free!(manifest_bytes_ptr);
 }
 
-/// Sign a fragmented BMFF asset set (init segment + media fragments).
-///
-/// Wraps [`c2pa::Builder::sign_fragmented_files`]. The output directory
-/// is populated with signed copies of the init segment (embedded JUMBF)
-/// plus fragment copies containing merkle-tree placeholders. After
-/// signing, the embedded manifest bytes are read back from the
-/// produced init segment and returned via the out-parameter.
-///
-/// # Parameters
-///
-/// * `builder_ptr` - pointer to a Builder with a manifest definition set.
-/// * `signer_ptr` - pointer to a Signer.
-/// * `asset_path` - null-terminated UTF-8 C string pointing to the init
-///   segment on disk. c2pa-rs accepts a glob pattern here for multi-init
-///   renditions; for StardustProof this is always a single init path.
-/// * `fragments_glob` - null-terminated UTF-8 C string with a filename
-///   glob (relative to the init segment's directory) matching the media
-///   fragments (e.g. `seg-*.m4s`).
-/// * `output_dir` - null-terminated UTF-8 C string with the output
-///   directory path. Created if it does not exist. c2pa-rs writes to
-///   `<output_dir>/<input_parent_dir_name>/...`; callers that want a
-///   flat layout must post-process.
-/// * `manifest_bytes_ptr` - out-pointer that receives the embedded
-///   manifest bytes on success. The returned bytes MUST be released by
-///   calling [`c2pa_free`].
-///
-/// # Safety
-///
-/// Reads from NULL-terminated C strings. `builder_ptr` and `signer_ptr`
-/// must point to valid, non-freed C2paBuilder / C2paSigner instances.
-///
-/// # Returns
-///
-/// The length of the manifest bytes on success, or `-1` on error.
 /// Expand `asset_path` as a glob and return the first signed init segment
 /// that c2pa-rs produced under `output_dir`.
 ///
@@ -2368,6 +2334,44 @@ fn glob_signed_init_path(
     None
 }
 
+/// Sign a fragmented BMFF asset set (init segment + media fragments).
+///
+/// Wraps [`c2pa::Builder::sign_fragmented_files`]. The output directory
+/// is populated with signed copies of each init segment (embedded JUMBF)
+/// plus fragment copies containing merkle-tree placeholders. After
+/// signing, the embedded manifest bytes are read back from a produced
+/// init segment and returned via the out-parameter; every rendition
+/// carries the identical manifest, so any of them yields the same bytes.
+///
+/// # Parameters
+///
+/// * `builder_ptr` - pointer to a Builder with a manifest definition set.
+/// * `signer_ptr` - pointer to a Signer.
+/// * `asset_path` - null-terminated UTF-8 C string pointing to the init
+///   segment on disk, or a glob pattern such as `<root>/*/init.mp4` that
+///   selects one init segment per rendition of an ABR ladder; every
+///   rendition it matches is covered by the one manifest. The renditions'
+///   parent directories must have distinct names, because each is written
+///   to `<output_dir>/<that name>/`; a collision is refused before signing.
+/// * `fragments_glob` - null-terminated UTF-8 C string with a filename
+///   glob (relative to the init segment's directory) matching the media
+///   fragments (e.g. `seg-*.m4s`).
+/// * `output_dir` - null-terminated UTF-8 C string with the output
+///   directory path. Created if it does not exist. c2pa-rs writes to
+///   `<output_dir>/<input_parent_dir_name>/...`; callers that want a
+///   flat layout must post-process.
+/// * `manifest_bytes_ptr` - out-pointer that receives the embedded
+///   manifest bytes on success. The returned bytes MUST be released by
+///   calling [`c2pa_free`].
+///
+/// # Safety
+///
+/// Reads from NULL-terminated C strings. `builder_ptr` and `signer_ptr`
+/// must point to valid, non-freed C2paBuilder / C2paSigner instances.
+///
+/// # Returns
+///
+/// The length of the manifest bytes on success, or `-1` on error.
 #[cfg(feature = "file_io")]
 #[no_mangle]
 pub unsafe extern "C" fn c2pa_builder_sign_fragmented(
@@ -5735,8 +5739,178 @@ verify_after_sign = true
         unsafe { c2pa_free(context as *mut c_void) };
     }
 
+    /// Copy the three `bunny` renditions into `root`, one directory each,
+    /// and return their directory names.
     #[cfg(feature = "file_io")]
+    fn stage_bunny_ladder(root: &std::path::Path) -> Vec<&'static str> {
+        let names = vec!["bunny_89283bps", "bunny_595491bps", "bunny_791182bps"];
+        let fixtures =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../sdk/tests/fixtures/bunny");
+        for name in &names {
+            let dest = root.join(name);
+            std::fs::create_dir_all(&dest).unwrap();
+            for entry in std::fs::read_dir(fixtures.join(name)).unwrap().flatten() {
+                std::fs::copy(entry.path(), dest.join(entry.file_name())).unwrap();
+            }
+        }
+        names
+    }
+
+    #[cfg(feature = "file_io")]
+    fn last_error() -> String {
+        let ptr = unsafe { c2pa_error() };
+        if ptr.is_null() {
+            return String::new();
+        }
+        let s = unsafe { std::ffi::CStr::from_ptr(ptr) }
+            .to_string_lossy()
+            .into_owned();
+        unsafe { c2pa_string_free(ptr) };
+        s
+    }
+
+    /// The real thing through the C entry point: a glob of three renditions
+    /// signs, the bytes handed back are the bytes embedded in every output,
+    /// and each output validates as a fragmented set.
     #[test]
+    #[cfg(feature = "file_io")]
+    fn sign_fragmented_glob_returns_the_manifest_embedded_in_every_rendition() {
+        let root = tempfile::tempdir().unwrap();
+        let output = tempfile::tempdir().unwrap();
+        let names = stage_bunny_ladder(root.path());
+
+        let (signer, builder) = setup_signer_and_builder_for_signing_tests();
+        let asset_path = CString::new(
+            root.path()
+                .join("*")
+                .join("BigBuckBunny_2s_init.mp4")
+                .to_str()
+                .unwrap(),
+        )
+        .unwrap();
+        let fragments_glob = CString::new("BigBuckBunny_2s*.m4s").unwrap();
+        let output_dir = CString::new(output.path().to_str().unwrap()).unwrap();
+        let mut manifest_ptr: *const c_uchar = std::ptr::null();
+        let len = unsafe {
+            c2pa_builder_sign_fragmented(
+                builder,
+                signer,
+                asset_path.as_ptr(),
+                fragments_glob.as_ptr(),
+                output_dir.as_ptr(),
+                &mut manifest_ptr,
+            )
+        };
+        assert!(len > 0, "sign_fragmented failed: {}", last_error());
+        let returned = unsafe { std::slice::from_raw_parts(manifest_ptr, len as usize) }.to_vec();
+        unsafe { c2pa_free(manifest_ptr as *const c_void) };
+
+        for name in &names {
+            let init = output.path().join(name).join("BigBuckBunny_2s_init.mp4");
+            let embedded = c2pa::jumbf_io::load_jumbf_from_file(&init).unwrap();
+            assert_eq!(
+                embedded, returned,
+                "{name}: returned bytes differ from the embedded manifest"
+            );
+
+            let mut fragments: Vec<std::path::PathBuf> = glob::glob(
+                output
+                    .path()
+                    .join(name)
+                    .join("BigBuckBunny_2s*.m4s")
+                    .to_str()
+                    .unwrap(),
+            )
+            .unwrap()
+            .flatten()
+            .collect();
+            fragments.sort();
+            assert!(!fragments.is_empty(), "{name}: no fragments were written");
+            // The test signer's certificate is untrusted and the empty
+            // definition has no action, so the overall state is not what is
+            // under test: the binding is. Every rendition must hash-match
+            // against the one shared assertion.
+            let reader = c2pa::Reader::from_fragmented_files(&init, &fragments)
+                .unwrap_or_else(|e| panic!("{name}: reader failed: {e}"));
+            let report = reader.json();
+            assert!(
+                report.contains("\"assertion.bmffHash.match\""),
+                "{name}: no BMFF hash match: {report}"
+            );
+            for failure in [
+                "assertion.bmffHash.mismatch",
+                "assertion.hashedURI.mismatch",
+            ] {
+                assert!(!report.contains(failure), "{name}: {failure}: {report}");
+            }
+        }
+
+        unsafe { c2pa_builder_free(builder) };
+        unsafe { c2pa_signer_free(signer) };
+    }
+
+    /// Two renditions whose directories share a name would be written into
+    /// one output directory; the SDK refuses that before signing anything.
+    #[test]
+    #[cfg(feature = "file_io")]
+    fn sign_fragmented_refuses_renditions_whose_directories_share_a_name() {
+        let root = tempfile::tempdir().unwrap();
+        let output = tempfile::tempdir().unwrap();
+        let fixtures =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../sdk/tests/fixtures/bunny");
+        for parent in ["a", "b"] {
+            let dest = root.path().join(parent).join("video");
+            std::fs::create_dir_all(&dest).unwrap();
+            for entry in std::fs::read_dir(fixtures.join("bunny_89283bps"))
+                .unwrap()
+                .flatten()
+            {
+                std::fs::copy(entry.path(), dest.join(entry.file_name())).unwrap();
+            }
+        }
+
+        let (signer, builder) = setup_signer_and_builder_for_signing_tests();
+        let asset_path = CString::new(
+            root.path()
+                .join("*")
+                .join("video")
+                .join("BigBuckBunny_2s_init.mp4")
+                .to_str()
+                .unwrap(),
+        )
+        .unwrap();
+        let fragments_glob = CString::new("BigBuckBunny_2s*.m4s").unwrap();
+        let output_dir = CString::new(output.path().to_str().unwrap()).unwrap();
+        let mut manifest_ptr: *const c_uchar = std::ptr::null();
+        let len = unsafe {
+            c2pa_builder_sign_fragmented(
+                builder,
+                signer,
+                asset_path.as_ptr(),
+                fragments_glob.as_ptr(),
+                output_dir.as_ptr(),
+                &mut manifest_ptr,
+            )
+        };
+        assert_eq!(len, -1);
+        let error = last_error();
+        assert!(
+            error.contains("rendition directories must have distinct names"),
+            "{error}"
+        );
+        assert!(manifest_ptr.is_null());
+        assert_eq!(
+            std::fs::read_dir(output.path()).unwrap().count(),
+            0,
+            "something was written despite the refusal"
+        );
+
+        unsafe { c2pa_builder_free(builder) };
+        unsafe { c2pa_signer_free(signer) };
+    }
+
+    #[test]
+    #[cfg(feature = "file_io")]
     fn glob_signed_init_path_resolves_multi_rendition_ladder() {
         // c2pa-rs expands a glob asset path into one init per rendition and
         // writes each to <output_dir>/<its parent dir name>/<its file name>.
