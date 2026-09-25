@@ -385,12 +385,14 @@ pub struct BmffHash {
 
 /// Rendition id used when a single-file fragmented asset is signed on its own.
 ///
-/// `uniqueId` is specified as 1-based -- "1-based unique id to determine which
-/// Merkle tree validates a given mdat box" -- and the multi-file writer
-/// already numbers its renditions `1..N`. Single-file assets were written
-/// with `0` before ladders existed, which this corrects; renditions of a
-/// ladder are numbered `1..N`, so a one-rung ladder still produces exactly
-/// what signing that asset alone produces.
+/// The specification's CDDL describes `uniqueId` as a "1-based unique id to
+/// determine which Merkle tree validates a given mdat box". That comment is
+/// non-normative (C2PA 2.4 says so of CDDL comments), so a historical `0` is
+/// not invalid -- but the multi-file writer already numbers its renditions
+/// `1..N`, and single-file assets were written with `0` only because they
+/// predate ladders. This aligns the two: renditions of a ladder are numbered
+/// `1..N`, so a one-rung ladder produces exactly what signing that asset
+/// alone produces.
 ///
 /// Reading is unaffected either way: a map is selected by the ids the asset's
 /// own `merkle` boxes carry, so assets already signed with `0` keep
@@ -399,9 +401,12 @@ pub(crate) const SINGLE_RENDITION_ID: usize = 1;
 
 /// Pick the `MerkleMap` that describes *this* single-file fragmented asset.
 ///
-/// A single-file fragmented asset is one track, so every `merkle` uuid box it
-/// carries names the same tree, and that tree is the only one that may be
-/// verified against it. When one manifest covers several renditions of the
+/// This verifier path supports one layout: a single-file fragmented asset
+/// carrying one track, whose `merkle` uuid boxes therefore all name the same
+/// tree -- the writer refuses anything else -- and that tree is the only one
+/// that may be verified against it. That is the supported-layout boundary of
+/// this path, not a property of fMP4 in general. When one manifest covers
+/// several renditions of the
 /// same content -- an ABR ladder, where each rendition has its own bytes but
 /// they share a claim -- the assertion holds one map per rendition. Checking
 /// this asset against a sibling's map fails on fragment count, or worse,
@@ -427,8 +432,8 @@ fn select_fragment_merkle_maps<'a>(
         return Ok(mm_vec.iter().collect());
     };
 
-    // One track means one tree. Boxes that disagree inside a fragmented asset
-    // cannot be attributed to a rendition at all.
+    // The supported layout is one track, hence one tree. Boxes that disagree
+    // inside a fragmented asset cannot be attributed to a rendition at all.
     if let Some(bad) = bmff_merkle
         .iter()
         .find(|b| b.unique_id != first.unique_id || b.local_id != first.local_id)
@@ -2734,8 +2739,10 @@ mod bmff_hash_tests {
 
     #[test]
     fn an_asset_without_merkle_boxes_keeps_every_map() {
-        // Non-fragmented layouts are keyed by block size rather than by box
-        // ids, so there is nothing to select on and nothing to change.
+        // An asset with no `merkle` uuid boxes carries no selection key: it
+        // is bound another way (a whole-file or mdat-chunk binding, whose
+        // maps are keyed by block size), so there is nothing to select on
+        // and every map is kept, exactly as before.
         let maps = vec![map_with_ids(0, 1, 4), map_with_ids(1, 1, 4)];
         let selected = select_fragment_merkle_maps(&maps, &[], true).unwrap();
         assert_eq!(selected.len(), 2);
