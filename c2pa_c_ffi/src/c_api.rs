@@ -5851,6 +5851,153 @@ verify_after_sign = true
 
     /// Two renditions whose directories share a name would be written into
     /// one output directory; the SDK refuses that before signing anything.
+    /// Sign `<root>/*/BigBuckBunny_2s_init.mp4` into `output` and return the
+    /// FFI result and the last error.
+    #[cfg(feature = "file_io")]
+    fn sign_bunny_glob(
+        root: &std::path::Path,
+        output: &std::path::Path,
+        glob: &str,
+    ) -> (i64, String) {
+        let (signer, builder) = setup_signer_and_builder_for_signing_tests();
+        let asset_path = CString::new(
+            root.join("*")
+                .join("BigBuckBunny_2s_init.mp4")
+                .to_str()
+                .unwrap(),
+        )
+        .unwrap();
+        let fragments_glob = CString::new(glob).unwrap();
+        let output_dir = CString::new(output.to_str().unwrap()).unwrap();
+        let mut manifest_ptr: *const c_uchar = std::ptr::null();
+        let len = unsafe {
+            c2pa_builder_sign_fragmented(
+                builder,
+                signer,
+                asset_path.as_ptr(),
+                fragments_glob.as_ptr(),
+                output_dir.as_ptr(),
+                &mut manifest_ptr,
+            )
+        };
+        if len > 0 {
+            unsafe { c2pa_free(manifest_ptr as *const c_void) };
+        }
+        unsafe { c2pa_builder_free(builder) };
+        unsafe { c2pa_signer_free(signer) };
+        (len, last_error())
+    }
+
+    /// Two output directories that already exist and are one directory under
+    /// two names would receive both renditions; refused before signing.
+    #[test]
+    #[cfg(feature = "file_io")]
+    #[cfg(unix)]
+    fn sign_fragmented_refuses_output_directories_that_alias_one_another() {
+        let root = tempfile::tempdir().unwrap();
+        let output = tempfile::tempdir().unwrap();
+        let names = stage_bunny_ladder(root.path());
+        std::fs::create_dir(output.path().join(names[0])).unwrap();
+        std::os::unix::fs::symlink(output.path().join(names[0]), output.path().join(names[1]))
+            .unwrap();
+
+        let (len, error) = sign_bunny_glob(root.path(), output.path(), "BigBuckBunny_2s*.m4s");
+        assert_eq!(len, -1, "{error}");
+        assert!(error.contains("is a symlink"), "{error}");
+        assert_eq!(
+            std::fs::read_dir(output.path().join(names[0]))
+                .unwrap()
+                .count(),
+            0,
+            "something was written despite the refusal"
+        );
+
+        // A dangling link is refused too: it would come alive once the
+        // rendition it points at is written, and route the other one there.
+        let output = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(output.path().join(names[0]), output.path().join(names[2]))
+            .unwrap();
+        let (len, error) = sign_bunny_glob(root.path(), output.path(), "BigBuckBunny_2s*.m4s");
+        assert_eq!(len, -1, "{error}");
+        assert!(error.contains("is a symlink"), "{error}");
+        assert!(!output.path().join(names[0]).exists());
+        assert!(!output.path().join(names[1]).exists());
+    }
+
+    /// A glob that matches the init segment itself is named as such.
+    #[test]
+    #[cfg(feature = "file_io")]
+    fn sign_fragmented_names_a_glob_that_matches_the_init() {
+        let root = tempfile::tempdir().unwrap();
+        let output = tempfile::tempdir().unwrap();
+        stage_bunny_ladder(root.path());
+        let (len, error) = sign_bunny_glob(root.path(), output.path(), "*.mp4");
+        assert_eq!(len, -1, "{error}");
+        assert!(error.contains("matches the init segment"), "{error}");
+        assert_eq!(std::fs::read_dir(output.path()).unwrap().count(), 0);
+    }
+
+    /// An output directory that IS a source rendition directory would sign
+    /// the input over itself; refused before signing.
+    #[test]
+    #[cfg(feature = "file_io")]
+    fn sign_fragmented_refuses_an_output_that_is_a_source_directory() {
+        let root = tempfile::tempdir().unwrap();
+        stage_bunny_ladder(root.path());
+        let before: Vec<(String, u64)> = glob::glob(root.path().join("*/*").to_str().unwrap())
+            .unwrap()
+            .flatten()
+            .map(|p| {
+                (
+                    p.display().to_string(),
+                    std::fs::metadata(&p).unwrap().len(),
+                )
+            })
+            .collect();
+
+        let (len, error) = sign_bunny_glob(root.path(), root.path(), "BigBuckBunny_2s*.m4s");
+        assert_eq!(len, -1, "{error}");
+        assert!(error.contains("is a source rendition directory"), "{error}");
+        let after: Vec<(String, u64)> = glob::glob(root.path().join("*/*").to_str().unwrap())
+            .unwrap()
+            .flatten()
+            .map(|p| {
+                (
+                    p.display().to_string(),
+                    std::fs::metadata(&p).unwrap().len(),
+                )
+            })
+            .collect();
+        assert_eq!(before, after, "a source was modified");
+    }
+
+    /// A fragment that the glob reaches in a subdirectory flattens to the
+    /// init's own name; the init writer would replace it. Refused before
+    /// anything is written.
+    #[test]
+    #[cfg(feature = "file_io")]
+    fn sign_fragmented_refuses_fragments_that_flatten_onto_the_init_name() {
+        let root = tempfile::tempdir().unwrap();
+        let output = tempfile::tempdir().unwrap();
+        let names = stage_bunny_ladder(root.path());
+        let video = root.path().join(names[0]);
+        let segments = video.join("segments");
+        std::fs::create_dir(&segments).unwrap();
+        std::fs::copy(
+            video.join("BigBuckBunny_2s1.m4s"),
+            segments.join("BigBuckBunny_2s_init.mp4"),
+        )
+        .unwrap();
+
+        let (len, error) = sign_bunny_glob(root.path(), output.path(), "segments/*.mp4");
+        assert_eq!(len, -1, "{error}");
+        assert!(
+            error.contains("fragment and init file names must be distinct"),
+            "{error}"
+        );
+        assert_eq!(std::fs::read_dir(output.path()).unwrap().count(), 0);
+    }
+
     #[test]
     #[cfg(feature = "file_io")]
     fn sign_fragmented_refuses_renditions_whose_directories_share_a_name() {
