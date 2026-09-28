@@ -8973,6 +8973,47 @@ pub mod tests {
         // std::fs::write("target/test.jpg", result).unwrap();
     }
 
+    /// The same rendition twice is not two renditions: both would be written
+    /// to one output directory, the second replacing the first while the
+    /// claim carried a Merkle map for each. Only a direct caller can express
+    /// it -- a glob cannot expand to the same path twice -- so it is checked
+    /// here rather than through the C API.
+    #[test]
+    #[cfg(feature = "file_io")]
+    fn test_fragmented_refuses_the_same_init_twice() {
+        let context = crate::context::Context::new();
+        let tempdir = tempdirectory().expect("temp dir");
+        let output_path = tempdir.path();
+
+        let init = glob::glob(&fixture_path("bunny/**/BigBuckBunny_2s_init.mp4").to_string_lossy())
+            .unwrap()
+            .flatten()
+            .next()
+            .expect("a bunny init segment");
+
+        let mut store = Store::from_context(&context);
+        store.commit_claim(create_test_claim().unwrap()).unwrap();
+        let signer = test_cawg_signer(SigningAlg::Ps256, &[labels::SCHEMA_ORG]).unwrap();
+        let error = store
+            .save_to_bmff_fragmented(
+                &[init.clone(), init],
+                &PathBuf::from("BigBuckBunny_2s*.m4s"),
+                &output_path.to_path_buf(),
+                signer.as_ref(),
+                &context,
+            )
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("was given more than once"),
+            "{error}"
+        );
+        assert_eq!(
+            std::fs::read_dir(output_path).unwrap().count(),
+            0,
+            "something was written despite the refusal"
+        );
+    }
+
     #[test]
     #[cfg(feature = "file_io")]
     fn test_fragmented_jumbf_generation() {
