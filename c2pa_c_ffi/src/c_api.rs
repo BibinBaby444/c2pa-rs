@@ -2329,7 +2329,9 @@ const MAX_LADDER_RENDITIONS: usize = 1024;
 ///   matched to `sources`. None may exist yet: each is created with
 ///   `create_new`, so a source, another output under any spelling or link, or
 ///   any pre-existing file is refused and nothing is overwritten. On error,
-///   every output this call created is removed again. A source that already
+///   the call removes the outputs it created -- best effort: a removal that
+///   fails is not reported, so do not infer from -1 that no output exists;
+///   discard whatever remains at the destinations. A source that already
 ///   carries a C2PA manifest is refused.
 /// * `count` - number of renditions; 1 to 1024.
 /// * `manifest_bytes_ptr` - out-pointer receiving the manifest embedded in

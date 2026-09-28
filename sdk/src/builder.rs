@@ -3126,8 +3126,10 @@ impl Builder {
     ///   exist yet: unlike [`Self::sign_file`], nothing is overwritten -- every
     ///   output is created with `create_new`, so a path that is a source,
     ///   another output under any spelling or link, or any pre-existing file
-    ///   is an error. On any error, every output this call created is removed
-    ///   again, so a failed call leaves no partial ladder behind.
+    ///   is an error. On any error, the call removes the outputs it created
+    ///   -- best effort: a removal that fails is not reported, so a caller
+    ///   must not infer from an error that no output exists, and should
+    ///   discard whatever is left at the destinations.
     ///
     /// # Returns
     /// * The bytes of the c2pa_manifest that was embedded in every rendition.

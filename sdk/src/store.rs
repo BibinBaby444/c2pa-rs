@@ -3213,9 +3213,10 @@ impl Store {
     /// `outputs` must be the same length as `inputs`, and none may exist yet:
     /// every output is created with `create_new`, so a path that is a source,
     /// another output under any spelling or link, or any other pre-existing
-    /// file is refused and nothing is ever overwritten. On any error, every
-    /// output this call created is removed again, so a failed call leaves no
-    /// partial ladder behind. No input may already carry a C2PA manifest: a
+    /// file is refused and nothing is ever overwritten. On any error the
+    /// outputs this call created are removed again, best effort: a removal
+    /// that fails is not reported, so a caller must not infer from an error
+    /// that no output exists. No input may already carry a C2PA manifest: a
     /// ladder signing adds no parent ingredient, so re-signing is refused
     /// rather than silently replacing provenance. The manifest is always
     /// embedded, so
@@ -3282,9 +3283,9 @@ impl Store {
         // follow one on Unix), a case-folded twin of an output created a
         // moment ago on a case-insensitive filesystem, or any other
         // pre-existing file -- is refused, and nothing that existed
-        // before this call is ever truncated. From here on any failure removes
-        // every output this call created, so a failed call leaves no partial
-        // ladder behind.
+        // before this call is ever truncated. From here on any failure
+        // removes the outputs this call created (best effort: a failed
+        // removal is not reported).
         let reserved = Store::reserve_ladder_outputs(outputs)?;
         let result = self.write_bmff_ladder(inputs, reserved, outputs, &format, signer, context);
         if result.is_err() {
@@ -3401,10 +3402,13 @@ impl Store {
             let mut cb = |step, total| context.check_progress(ProgressPhase::Hashing, step, total);
             bmff_hash.finalize_single_file_merkle(dest, unique_id, &mut cb)?;
         }
-        // The patch below and the verification reopen by path. Before each
-        // reopen, check that the path still names the file that was reserved
-        // and written -- a swap in the output directory would otherwise
-        // receive the patch. The handles are dropped only afterwards.
+        // The patch below and the verification reopen by path. Before the
+        // patch, check that the path still names the file that was reserved
+        // and written. This is a consistency check, not a lock: a path
+        // replaced between the check and the reopen is not detected, the
+        // verification reopen after the handles are dropped is unguarded,
+        // and the output directory is assumed to be the caller's own while
+        // the call runs.
 
         // 3) Fold every rendition's hashes back into the one assertion.
         let pc = self.provenance_claim_mut().ok_or(Error::ClaimEncoding)?;
