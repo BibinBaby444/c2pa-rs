@@ -3011,8 +3011,14 @@ impl Store {
         // fragment glob reached into. Three things can collide there, each
         // silently replacing a file the claim still carries a hash for:
         //  - two renditions whose init parents share a name (`a/video/init.mp4`
-        //    and `b/video/init.mp4`), compared case-insensitively because the
-        //    output filesystem may be;
+        //    and `b/video/init.mp4`). Names are compared case-insensitively on
+        //    EVERY filesystem, deliberately: the output filesystem may fold
+        //    case even when the input's does not, and the restriction has to
+        //    hold wherever the outputs land. The comparison is a Unicode
+        //    lowercase of the name, not a normalization (`é` and `e\u{301}`
+        //    stay distinct) and not a filesystem identity check, so it is a
+        //    conservative rule, not a promise of detecting every alias; only
+        //    ASCII names have been exercised across platforms;
         //  - two rendition output directories that already exist and are the
         //    same directory under different names (`out/high -> out/low`), or
         //    an output directory that IS a source rendition directory;
@@ -3124,6 +3130,18 @@ impl Store {
                         )))
                     }
                 }
+            }
+
+            // A rendition without fragments is a layout error, and a cheap one
+            // to catch here: `add_merkmap_for_rendition` would refuse it too,
+            // but only when that rendition's turn comes, by which time earlier
+            // rungs have already been written.
+            if fragments.is_empty() {
+                return Err(Error::BadParam(format!(
+                    "fragment glob {} matched no media segments for init segment {}",
+                    frag_glob.display(),
+                    init_path.display()
+                )));
             }
 
             // every written name within the rendition must be distinct
@@ -8971,6 +8989,70 @@ pub mod tests {
 
         assert!(!report.has_any_error());
         // std::fs::write("target/test.jpg", result).unwrap();
+    }
+
+    /// A rendition whose fragment glob matches nothing is refused during
+    /// preflight, before any rendition is written. Checked with two rungs,
+    /// the first complete and the second an init with no segments: the old
+    /// order signed the first rung and only then discovered the second was
+    /// empty, leaving a partial ladder on disk.
+    #[test]
+    #[cfg(feature = "file_io")]
+    fn test_fragmented_refuses_an_empty_fragment_match_before_writing_anything() {
+        let context = crate::context::Context::new();
+        let tempdir = tempdirectory().expect("temp dir");
+        let root = tempdir.path();
+
+        let source_init =
+            glob::glob(&fixture_path("bunny/**/BigBuckBunny_2s_init.mp4").to_string_lossy())
+                .unwrap()
+                .flatten()
+                .next()
+                .expect("a bunny init segment");
+        let source_dir = source_init.parent().unwrap();
+
+        // Rung `a` is complete; rung `b` has the init segment and nothing else.
+        let complete = root.join("a");
+        let empty = root.join("b");
+        std::fs::create_dir_all(&complete).unwrap();
+        std::fs::create_dir_all(&empty).unwrap();
+        for entry in std::fs::read_dir(source_dir).unwrap().flatten() {
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if name_str.starts_with("BigBuckBunny_2s") && entry.path().is_file() {
+                std::fs::copy(entry.path(), complete.join(&name)).unwrap();
+            }
+        }
+        std::fs::copy(&source_init, empty.join("BigBuckBunny_2s_init.mp4")).unwrap();
+        assert!(
+            std::fs::read_dir(&complete).unwrap().count() > 1,
+            "the complete rung should carry fragments"
+        );
+
+        let output_path = root.join("output");
+        let mut store = Store::from_context(&context);
+        store.commit_claim(create_test_claim().unwrap()).unwrap();
+        let signer = test_cawg_signer(SigningAlg::Ps256, &[labels::SCHEMA_ORG]).unwrap();
+        let error = store
+            .save_to_bmff_fragmented(
+                &[
+                    complete.join("BigBuckBunny_2s_init.mp4"),
+                    empty.join("BigBuckBunny_2s_init.mp4"),
+                ],
+                &PathBuf::from("BigBuckBunny_2s*.m4s"),
+                &output_path,
+                signer.as_ref(),
+                &context,
+            )
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("matched no media segments"),
+            "{error}"
+        );
+        assert!(
+            !output_path.exists() || std::fs::read_dir(&output_path).unwrap().count() == 0,
+            "the complete rung was written despite the refusal"
+        );
     }
 
     /// The same rendition twice is not two renditions: both would be written

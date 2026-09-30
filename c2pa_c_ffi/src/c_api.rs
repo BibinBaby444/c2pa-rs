@@ -2350,12 +2350,19 @@ fn glob_signed_init_path(
 /// * `asset_path` - null-terminated UTF-8 C string pointing to the init
 ///   segment on disk, or a glob pattern such as `<root>/*/init.mp4` that
 ///   selects one init segment per rendition of an ABR ladder; every
-///   rendition it matches is covered by the one manifest. The renditions'
-///   parent directories must have distinct names, because each is written
-///   to `<output_dir>/<that name>/`; a collision is refused before signing.
+///   rendition it matches is covered by the one manifest. Each rendition is
+///   written to `<output_dir>/<name of the init's parent directory>/`, so
+///   the renditions' parent directories must have distinct names. Names are
+///   compared case-insensitively on every filesystem, deliberately: the
+///   output filesystem may fold case even when the input's does not. The
+///   comparison lowercases the name; it is not Unicode normalization and
+///   not a filesystem identity check, so it is a conservative rule rather
+///   than a guarantee of catching every alias, and only ASCII names have
+///   been exercised across platforms.
 /// * `fragments_glob` - null-terminated UTF-8 C string with a filename
 ///   glob (relative to the init segment's directory) matching the media
-///   fragments (e.g. `seg-*.m4s`).
+///   fragments (e.g. `seg-*.m4s`). It is applied per rendition and must
+///   match at least one segment in each.
 /// * `output_dir` - null-terminated UTF-8 C string with the output
 ///   directory path. Created if it does not exist. c2pa-rs writes to
 ///   `<output_dir>/<input_parent_dir_name>/...`; callers that want a
@@ -2363,6 +2370,24 @@ fn glob_signed_init_path(
 /// * `manifest_bytes_ptr` - out-pointer that receives the embedded
 ///   manifest bytes on success. The returned bytes MUST be released by
 ///   calling [`c2pa_free`].
+///
+/// # Refusals
+///
+/// The whole set is checked before any rendition is signed or any file is
+/// created, so each of these returns `-1` with nothing written:
+///
+/// * two renditions whose parent directories share a name (case-insensitively,
+///   as above), which would be written to the same output directory;
+/// * a rendition output directory that already exists and is a link, whether
+///   or not its target exists yet -- a dangling `out/z -> out/a` would come
+///   alive once `a` is written -- or that is the same directory as another
+///   rendition's output under a different name;
+/// * a rendition output directory that IS a source rendition directory, which
+///   would sign the input over itself;
+/// * a fragment whose file name, once flattened into the rendition's output
+///   directory, equals the init segment's or another fragment's;
+/// * a fragment glob that matches the init segment itself, or that matches no
+///   media segment for a rendition.
 ///
 /// # Safety
 ///
@@ -5849,8 +5874,6 @@ verify_after_sign = true
         unsafe { c2pa_signer_free(signer) };
     }
 
-    /// Two renditions whose directories share a name would be written into
-    /// one output directory; the SDK refuses that before signing anything.
     /// Sign `<root>/*/BigBuckBunny_2s_init.mp4` into `output` and return the
     /// FFI result and the last error.
     #[cfg(feature = "file_io")]
@@ -5973,21 +5996,34 @@ verify_after_sign = true
 
     /// A fragment that the glob reaches in a subdirectory flattens to the
     /// init's own name; the init writer would replace it. Refused before
-    /// anything is written.
+    /// anything is written. Every rendition gets the subdirectory, so the
+    /// glob matches something in each and the flattening collision is the
+    /// only defect: with it in one rendition alone, the others' empty match
+    /// is refused first.
     #[test]
     #[cfg(feature = "file_io")]
     fn sign_fragmented_refuses_fragments_that_flatten_onto_the_init_name() {
         let root = tempfile::tempdir().unwrap();
         let output = tempfile::tempdir().unwrap();
-        let names = stage_bunny_ladder(root.path());
-        let video = root.path().join(names[0]);
-        let segments = video.join("segments");
-        std::fs::create_dir(&segments).unwrap();
-        std::fs::copy(
-            video.join("BigBuckBunny_2s1.m4s"),
-            segments.join("BigBuckBunny_2s_init.mp4"),
-        )
-        .unwrap();
+        for name in stage_bunny_ladder(root.path()) {
+            let video = root.path().join(name);
+            // Each rendition's segments are numbered differently, so take
+            // whichever fragment this one has rather than a fixed name.
+            let fragment = std::fs::read_dir(&video)
+                .unwrap()
+                .flatten()
+                .map(|entry| entry.path())
+                .find(|path| {
+                    path.extension().is_some_and(|ext| ext == "m4s")
+                        && path
+                            .file_name()
+                            .is_some_and(|f| f.to_string_lossy().starts_with("BigBuckBunny_2s"))
+                })
+                .expect("a bunny fragment");
+            let segments = video.join("segments");
+            std::fs::create_dir(&segments).unwrap();
+            std::fs::copy(fragment, segments.join("BigBuckBunny_2s_init.mp4")).unwrap();
+        }
 
         let (len, error) = sign_bunny_glob(root.path(), output.path(), "segments/*.mp4");
         assert_eq!(len, -1, "{error}");
@@ -5998,6 +6034,8 @@ verify_after_sign = true
         assert_eq!(std::fs::read_dir(output.path()).unwrap().count(), 0);
     }
 
+    /// Two renditions whose directories share a name would be written into
+    /// one output directory; the SDK refuses that before signing anything.
     #[test]
     #[cfg(feature = "file_io")]
     fn sign_fragmented_refuses_renditions_whose_directories_share_a_name() {
