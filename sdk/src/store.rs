@@ -3213,15 +3213,19 @@ impl Store {
     /// `outputs` must be the same length as `inputs`, and none may exist yet:
     /// every output is created with `create_new`, so a path that is a source,
     /// another output under any spelling or link, or any other pre-existing
-    /// file is refused and nothing is ever overwritten. On any error the
-    /// outputs this call created are removed again, best effort: a removal
-    /// that fails is not reported, so a caller must not infer from an error
-    /// that no output exists, and should discard only the leftovers this
-    /// call created -- an error can mean a destination already existed, and
-    /// such a pre-existing file must not be deleted. The outputs are expected
-    /// to be stable paths in a directory the caller controls for the duration
-    /// of the call; the pre-patch identity check is a consistency check, not
-    /// a lock. No input may already carry a C2PA manifest: a
+    /// file is refused and nothing is ever overwritten. On any error after
+    /// the reservation, whatever is then at the reserved output paths is
+    /// removed -- by path, not by identity, so under the stable-path
+    /// assumption that is exactly this call's outputs, and a file placed at
+    /// an output path by someone else during the call goes with them. Best
+    /// effort: a removal that fails is not reported, so a caller must not
+    /// infer from an error that no output exists, and should discard only
+    /// the leftovers at the paths it passed, never a pre-existing
+    /// destination, which the reservation refuses and never touches. The
+    /// outputs are expected to be stable paths in a directory the caller
+    /// controls for the duration of the call; the pre-patch identity check is
+    /// a consistency check, not a lock. No input may already carry a C2PA
+    /// manifest: a
     /// ladder signing adds no parent ingredient, so re-signing is refused
     /// rather than silently replacing provenance. The manifest is always
     /// embedded, so

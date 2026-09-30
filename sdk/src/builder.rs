@@ -3126,12 +3126,17 @@ impl Builder {
     ///   exist yet: unlike [`Self::sign_file`], nothing is overwritten -- every
     ///   output is created with `create_new`, so a path that is a source,
     ///   another output under any spelling or link, or any pre-existing file
-    ///   is an error. On any error, the call removes the outputs it created
-    ///   -- best effort: a removal that fails is not reported, so a caller
-    ///   must not infer from an error that no output exists, and should
-    ///   discard the leftovers this call created. Discard only those: an
-    ///   error can mean a destination already existed, including a source or
-    ///   a link to one, and such a pre-existing file must not be deleted.
+    ///   is an error, and such a pre-existing file is never touched. On any
+    ///   error after the reservation the call removes what is then at the
+    ///   output paths it reserved -- by path, not by identity: it does not
+    ///   re-check that each is still the file it created, so under the
+    ///   assumption below that is exactly its own outputs, and a file someone
+    ///   else put at an output path during the call is removed too, even
+    ///   though the identity check refuses to sign over it. The removal is
+    ///   best effort: one that fails is not reported, so a caller must not
+    ///   infer from an error that no output exists, and should discard only
+    ///   the leftovers at the paths it passed -- never a destination that
+    ///   existed before the call, such as a source or a link to one.
     ///
     /// The destinations are expected to be stable paths in a directory the
     /// caller controls for the duration of the call. Each output is checked
