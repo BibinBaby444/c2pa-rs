@@ -9046,12 +9046,132 @@ pub mod tests {
             )
             .unwrap_err();
         assert!(
+            !output_path.exists() || std::fs::read_dir(&output_path).unwrap().count() == 0,
+            "the complete rung's fragments were written despite the refusal"
+        );
+        assert!(
             error.to_string().contains("matched no media segments"),
             "{error}"
         );
+    }
+
+    /// Rendition directory names are compared case-insensitively on every
+    /// filesystem: `a/Video` and `b/video` would land in one output
+    /// directory wherever the output filesystem folds case, so they are
+    /// refused everywhere, with nothing written.
+    #[test]
+    #[cfg(feature = "file_io")]
+    fn test_fragmented_refuses_rendition_directories_that_differ_only_by_case() {
+        let context = crate::context::Context::new();
+        let tempdir = tempdirectory().expect("temp dir");
+        let root = tempdir.path();
+        let source_init =
+            glob::glob(&fixture_path("bunny/**/BigBuckBunny_2s_init.mp4").to_string_lossy())
+                .unwrap()
+                .flatten()
+                .next()
+                .expect("a bunny init segment");
+        let source_dir = source_init.parent().unwrap();
+
+        let mut inits = Vec::new();
+        for (parent, name) in [("a", "Video"), ("b", "video")] {
+            let dir = root.join(parent).join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            for entry in std::fs::read_dir(source_dir).unwrap().flatten() {
+                let file_name = entry.file_name();
+                if file_name.to_string_lossy().starts_with("BigBuckBunny_2s")
+                    && entry.path().is_file()
+                {
+                    std::fs::copy(entry.path(), dir.join(&file_name)).unwrap();
+                }
+            }
+            inits.push(dir.join("BigBuckBunny_2s_init.mp4"));
+        }
+
+        let output_path = root.join("output");
+        let mut store = Store::from_context(&context);
+        store.commit_claim(create_test_claim().unwrap()).unwrap();
+        let signer = test_cawg_signer(SigningAlg::Ps256, &[labels::SCHEMA_ORG]).unwrap();
+        let error = store
+            .save_to_bmff_fragmented(
+                &inits,
+                &PathBuf::from("BigBuckBunny_2s*.m4s"),
+                &output_path,
+                signer.as_ref(),
+                &context,
+            )
+            .unwrap_err();
         assert!(
             !output_path.exists() || std::fs::read_dir(&output_path).unwrap().count() == 0,
-            "the complete rung was written despite the refusal"
+            "something was written despite the refusal"
+        );
+        assert!(
+            error.to_string().contains("would both be written to"),
+            "{error}"
+        );
+    }
+
+    /// Two fragments that flatten to one file name -- `x/BigBuckBunny_2s_seg.m4s`
+    /// and `y/BigBuckBunny_2s_SEG.m4s`, reached by the same glob -- would
+    /// overwrite each other in the rendition's output directory. Refused with
+    /// nothing written, and compared case-insensitively like the directory
+    /// names are.
+    #[test]
+    #[cfg(feature = "file_io")]
+    fn test_fragmented_refuses_fragments_that_flatten_onto_each_other() {
+        let context = crate::context::Context::new();
+        let tempdir = tempdirectory().expect("temp dir");
+        let root = tempdir.path();
+        let source_init =
+            glob::glob(&fixture_path("bunny/**/BigBuckBunny_2s_init.mp4").to_string_lossy())
+                .unwrap()
+                .flatten()
+                .next()
+                .expect("a bunny init segment");
+        let source_fragment = std::fs::read_dir(source_init.parent().unwrap())
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.path())
+            .find(|path| path.extension().is_some_and(|ext| ext == "m4s"))
+            .expect("a bunny fragment");
+
+        let video = root.join("video");
+        std::fs::create_dir_all(video.join("x")).unwrap();
+        std::fs::create_dir_all(video.join("y")).unwrap();
+        std::fs::copy(&source_init, video.join("BigBuckBunny_2s_init.mp4")).unwrap();
+        std::fs::copy(
+            &source_fragment,
+            video.join("x").join("BigBuckBunny_2s_seg.m4s"),
+        )
+        .unwrap();
+        std::fs::copy(
+            &source_fragment,
+            video.join("y").join("BigBuckBunny_2s_SEG.m4s"),
+        )
+        .unwrap();
+
+        let output_path = root.join("output");
+        let mut store = Store::from_context(&context);
+        store.commit_claim(create_test_claim().unwrap()).unwrap();
+        let signer = test_cawg_signer(SigningAlg::Ps256, &[labels::SCHEMA_ORG]).unwrap();
+        let error = store
+            .save_to_bmff_fragmented(
+                &[video.join("BigBuckBunny_2s_init.mp4")],
+                &PathBuf::from("*/BigBuckBunny_2s_*.m4s"),
+                &output_path,
+                signer.as_ref(),
+                &context,
+            )
+            .unwrap_err();
+        assert!(
+            !output_path.exists() || std::fs::read_dir(&output_path).unwrap().count() == 0,
+            "something was written despite the refusal"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("fragment and init file names must be distinct"),
+            "{error}"
         );
     }
 

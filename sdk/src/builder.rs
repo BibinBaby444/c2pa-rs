@@ -3068,8 +3068,9 @@ impl Builder {
     /// even a dangling one, or that is another rendition's output directory
     /// under a different name; an output directory that is a source rendition
     /// directory; a fragment whose flattened file name equals the init's or
-    /// another fragment's; a fragment glob that matches the init itself, or
-    /// that matches no media segment for a rendition.
+    /// another fragment's, compared case-insensitively as above; a fragment
+    /// glob that matches the init itself, or that matches no media segment
+    /// for a rendition.
     ///
     /// # Arguments
     /// * `signer` - The signer to use.

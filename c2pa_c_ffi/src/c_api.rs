@@ -2385,9 +2385,14 @@ fn glob_signed_init_path(
 /// * a rendition output directory that IS a source rendition directory, which
 ///   would sign the input over itself;
 /// * a fragment whose file name, once flattened into the rendition's output
-///   directory, equals the init segment's or another fragment's;
+///   directory, equals the init segment's or another fragment's, compared
+///   case-insensitively as above;
 /// * a fragment glob that matches the init segment itself, or that matches no
 ///   media segment for a rendition.
+///
+/// Argument errors are refused the same way, with nothing written: a glob that
+/// matches no init segment, an init segment that is not a BMFF type, an
+/// `output_dir` that is an existing file, or an invalid glob.
 ///
 /// # Safety
 ///
