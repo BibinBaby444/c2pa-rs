@@ -2331,8 +2331,13 @@ const MAX_LADDER_RENDITIONS: usize = 1024;
 ///   any pre-existing file is refused and nothing is overwritten. On error,
 ///   the call removes the outputs it created -- best effort: a removal that
 ///   fails is not reported, so do not infer from -1 that no output exists;
-///   discard whatever remains at the destinations. A source that already
-///   carries a C2PA manifest is refused.
+///   discard the leftovers this call created, and only those: -1 can mean a
+///   destination already existed, including a source or a link to one, and
+///   such a pre-existing file must not be deleted. The destinations are
+///   expected to be stable paths in a directory the caller controls for the
+///   duration of the call; each output is checked to still be the reserved
+///   file before it is patched, which is a consistency check, not a lock. A
+///   source that already carries a C2PA manifest is refused.
 /// * `count` - number of renditions; 1 to 1024.
 /// * `manifest_bytes_ptr` - out-pointer receiving the manifest embedded in
 ///   every rendition. Released with [`c2pa_free`].

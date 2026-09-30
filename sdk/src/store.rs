@@ -3216,7 +3216,12 @@ impl Store {
     /// file is refused and nothing is ever overwritten. On any error the
     /// outputs this call created are removed again, best effort: a removal
     /// that fails is not reported, so a caller must not infer from an error
-    /// that no output exists. No input may already carry a C2PA manifest: a
+    /// that no output exists, and should discard only the leftovers this
+    /// call created -- an error can mean a destination already existed, and
+    /// such a pre-existing file must not be deleted. The outputs are expected
+    /// to be stable paths in a directory the caller controls for the duration
+    /// of the call; the pre-patch identity check is a consistency check, not
+    /// a lock. No input may already carry a C2PA manifest: a
     /// ladder signing adds no parent ingredient, so re-signing is refused
     /// rather than silently replacing provenance. The manifest is always
     /// embedded, so

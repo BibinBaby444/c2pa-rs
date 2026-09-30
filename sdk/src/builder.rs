@@ -3129,7 +3129,16 @@ impl Builder {
     ///   is an error. On any error, the call removes the outputs it created
     ///   -- best effort: a removal that fails is not reported, so a caller
     ///   must not infer from an error that no output exists, and should
-    ///   discard whatever is left at the destinations.
+    ///   discard the leftovers this call created. Discard only those: an
+    ///   error can mean a destination already existed, including a source or
+    ///   a link to one, and such a pre-existing file must not be deleted.
+    ///
+    /// The destinations are expected to be stable paths in a directory the
+    /// caller controls for the duration of the call. Each output is checked
+    /// to still be the file that was reserved and written before it is
+    /// patched, but that is a consistency check, not a lock: a path replaced
+    /// between the check and the reopen is not detected, and the verification
+    /// reopen after the handles are dropped is unguarded.
     ///
     /// # Returns
     /// * The bytes of the c2pa_manifest that was embedded in every rendition.
