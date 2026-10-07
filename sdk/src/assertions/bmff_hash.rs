@@ -698,6 +698,21 @@ impl BmffHash {
         exclusions.clone_from(&self.exclusions().to_vec());
     }
 
+    /// Adds an exclusion for every root-level `sidx` box. See
+    /// `core.single_file_fragment_exclude_sidx`.
+    pub(crate) fn exclude_root_sidx(&mut self) {
+        if !self.exclusions.iter().any(|e| {
+            e.xpath == "/sidx"
+                && e.length.is_none()
+                && e.data.is_none()
+                && e.subset.is_none()
+                && e.version.is_none()
+                && e.flags.is_none()
+        }) {
+            self.exclusions.push(ExclusionsMap::new("/sidx".to_owned()));
+        }
+    }
+
     // Adds default exclusion ranges for BMFF hashes.  Add as needed.
     pub fn set_default_exclusions(&mut self) -> &[ExclusionsMap] {
         let exclusions = &mut self.exclusions;
@@ -2046,9 +2061,11 @@ impl BmffHash {
     ///
     /// A fragment cut anywhere else (for example at a `sidx`), or one that
     /// stops short of the next `merkle` uuid box, then fails with a hash
-    /// mismatch, as does the right fragment at the wrong offset. A caller
-    /// whose segments are cut elsewhere must regroup the bytes into leaves
-    /// first.
+    /// mismatch, as does the right fragment at the wrong offset. If the asset
+    /// was signed with `core.single_file_fragment_exclude_sidx`, `sidx` boxes
+    /// are excluded too, so a fragment cut from its `sidx` to the end of its
+    /// `mdat` (with `init_stream` ending before the first `sidx`) also
+    /// verifies.
     ///
     /// The offset is supplied by the caller, so this proves the bytes belong
     /// to the leaf they name, not that the caller fetched them from where it

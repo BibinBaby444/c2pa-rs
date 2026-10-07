@@ -227,6 +227,7 @@ Here's the Settings JSON with all default values:
     "merkle_tree_chunk_size_in_kb": null,
     "merkle_tree_max_proofs": 5,
     "merkle_tree_max_leaves": 10000,
+    "single_file_fragment_exclude_sidx": false,
     "backing_store_memory_threshold_in_mb": 512,
     "decode_identity_assertions": true,
     "allowed_network_hosts": null
@@ -263,6 +264,18 @@ It takes
 precedence over `core.merkle_tree_chunk_size_in_kb` and is bounded by
 `core.merkle_tree_max_leaves` (default 10,000) plus the hash-memory budget.
 Exceeding the limit fails rather than silently falling back to a flat hash.
+
+Each leaf runs from one `moof` to the next, so a per-fragment `sidx` written
+before each `moof` (for example by FFmpeg's `+dash` movflag) is hashed with the
+*previous* leaf. A player that cuts byte-range segments at each `sidx` then
+cannot verify a segment without regrouping bytes across segments. Setting
+`core.single_file_fragment_exclude_sidx` to `true` adds `/sidx` to the
+assertion's exclusions, so such segments verify as delivered (with
+`Reader::from_fragment_at_offset`). The `sidx` boxes are then not integrity
+protected. The media they index stays bound, but the segment index is no
+longer authenticated: a player that takes segment order or timing from `sidx`
+(DASH `SegmentBase`) can be steered to skip, repeat or reorder genuine
+fragments without a validation failure.
 
 Supported media has one stable track: `localId` is the tkhd track ID and every
 moof must contain one matching tfhd. Multiplexed or changing track layouts fail

@@ -3526,6 +3526,9 @@ impl Store {
                 unique_id,
             )?);
         }
+        if settings.core.single_file_fragment_exclude_sidx {
+            bmff_hash.exclude_root_sidx();
+        }
         let pc = self.provenance_claim_mut().ok_or(Error::ClaimEncoding)?;
         pc.add_assertion(&bmff_hash)?;
 
@@ -3931,6 +3934,9 @@ impl Store {
                     )?;
                     intermediate_stream = temp_stream;
                     single_file_fragments = true;
+                    if settings.core.single_file_fragment_exclude_sidx {
+                        bmff_hash.exclude_root_sidx();
+                    }
                 } else {
                     Store::generate_bmff_mdat_hashes(
                         &mut intermediate_stream,

@@ -231,6 +231,30 @@ pub struct Core {
     /// Single-file fragment signing stores a leaf row (no proofs); this bounds
     /// the manifest size independently of the media file size. Defaults to 10,000.
     pub merkle_tree_max_leaves: usize,
+    /// Exclude root-level `sidx` boxes from the hash when signing a
+    /// single-file fragmented BMFF asset (fragment Merkle binding).
+    ///
+    /// A leaf of such an asset runs from one `moof` to the next, so a
+    /// per-fragment `sidx` written before each `moof` is hashed as part of the
+    /// *previous* leaf. Players and packagers that cut segments at each `sidx`
+    /// (byte-range HLS playlists) then hand a validator
+    /// bytes that do not match any leaf. With this option the `sidx` boxes are
+    /// listed in the assertion's exclusions, so a segment verifies whether it
+    /// is cut at its `sidx` or at its C2PA `merkle` box.
+    ///
+    /// The `sidx` boxes are then not integrity protected. The media they index
+    /// stays bound, including every later box's absolute offset, so a tampered
+    /// or resized `sidx` cannot make altered media verify. But the segment
+    /// index itself is no longer authenticated: a player that takes segment
+    /// order or timing from `sidx` (DASH `SegmentBase`) can be steered to
+    /// skip, repeat or reorder genuine fragments without a validation
+    /// failure, and junk `sidx` boxes can be appended where no hashed box
+    /// follows (as `free` and `skip` already can). Under default signing the
+    /// per-fragment `sidx` boxes are bound. Validators that follow the
+    /// assertion's exclusion list need no change.
+    ///
+    /// Defaults to false.
+    pub single_file_fragment_exclude_sidx: bool,
     /// Maximum amount of data in megabytes that will be loaded into memory before
     /// being stored in temporary files on the disk.
     ///
@@ -305,6 +329,7 @@ impl Default for Core {
             merkle_tree_chunk_size_in_kb: None,
             merkle_tree_max_proofs: 5,
             merkle_tree_max_leaves: 10_000,
+            single_file_fragment_exclude_sidx: false,
             backing_store_memory_threshold_in_mb: 512,
             decode_identity_assertions: true,
             allowed_network_hosts: None,

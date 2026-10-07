@@ -1049,3 +1049,47 @@ fn ladder_segments_verify_against_the_shared_manifest() {
         "rendition 2's segment must not verify under rendition 0's init"
     );
 }
+
+#[test]
+fn ladder_with_excluded_sidx_verifies_sidx_cut_segments() {
+    const SIDX: &[u8] = include_bytes!("../../tests/fixtures/single_file_fragments_sidx.mp4");
+    let dir = tempfile::tempdir().unwrap();
+    let mut sources = Vec::new();
+    let mut outputs = Vec::new();
+    for i in 0..2u8 {
+        let source = dir.path().join(format!("r{i}.mp4"));
+        std::fs::write(&source, rendition(SIDX, i + 1)).unwrap();
+        sources.push(source);
+        outputs.push(dir.path().join(format!("s{i}.mp4")));
+    }
+    let settings = Settings::new()
+        .with_value("core.single_file_fragment_exclude_sidx", true)
+        .unwrap();
+    Builder::from_context(Context::new().with_settings(settings).unwrap())
+        .with_definition(DEFINITION)
+        .unwrap()
+        .sign_ladder_files(test_signer(SigningAlg::Es256).as_ref(), &sources, &outputs)
+        .unwrap();
+
+    for out in &outputs {
+        let signed = std::fs::read(out).unwrap();
+        let hash = binding(&signed);
+        assert!(hash.exclusions.iter().any(|e| e.xpath == "/sidx"));
+        assert_eq!(maps(&hash).len(), 2);
+
+        let r = roots(&signed);
+        let sidx: Vec<B> = r.iter().copied().filter(|b| b.kind == *b"sidx").collect();
+        let mdat: Vec<B> = r.iter().copied().filter(|b| b.kind == *b"mdat").collect();
+        let init = &signed[..sidx[0].start];
+        for (s, m) in sidx.iter().zip(&mdat) {
+            assert!(matches!(
+                segment_state(init, &signed[s.start..m.end], s.start as u64),
+                ValidationState::Valid | ValidationState::Trusted
+            ));
+            assert_eq!(
+                segment_state(init, &signed[s.start..m.end], s.start as u64 + 1),
+                ValidationState::Invalid
+            );
+        }
+    }
+}

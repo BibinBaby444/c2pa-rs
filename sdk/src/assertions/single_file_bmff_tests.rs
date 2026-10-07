@@ -1266,15 +1266,32 @@ fn single_file_segment_direct_hash_api() {
 }
 
 // ---------------------------------------------------------------------------
-// Per-fragment `sidx` (FFmpeg `+dash`, the layout byte-range HLS packagers
-// cut at): each `sidx` is hashed with the previous fragment's leaf, so a
-// segment cut at its `sidx` matches no leaf, while the specification's cut
-// (merkle box to merkle box) verifies at its offset.
+// core.single_file_fragment_exclude_sidx: segments cut at each per-fragment
+// `sidx` (how byte-range HLS packagers and DASH SegmentBase address a
+// single-file fMP4) verify directly when the signer excludes `sidx`.
 // ---------------------------------------------------------------------------
 
 /// ffmpeg 6.1.1 `+dash` output: a `sidx` before every `moof`, then `mfra`.
 const PER_FRAGMENT_SIDX: &[u8] =
     include_bytes!("../../tests/fixtures/single_file_fragments_sidx.mp4");
+
+fn sign_with(input: &[u8], exclude_sidx: bool) -> Vec<u8> {
+    let settings = Settings::new()
+        .with_value("core.single_file_fragment_exclude_sidx", exclude_sidx)
+        .unwrap();
+    let mut output = Cursor::new(Vec::new());
+    Builder::from_context(Context::new().with_settings(settings).unwrap())
+        .with_definition(DEFINITION)
+        .unwrap()
+        .sign(
+            test_signer(SigningAlg::Es256).as_ref(),
+            "video/mp4",
+            &mut Cursor::new(input),
+            &mut output,
+        )
+        .unwrap();
+    output.into_inner()
+}
 
 /// The cut a sidx-walking packager writes: init = everything before the first
 /// `sidx`; segment i = from `sidx` i to the end of `mdat` i.
@@ -1295,8 +1312,9 @@ fn sidx_cut(signed: &[u8]) -> (Vec<u8>, Vec<(u64, Vec<u8>)>) {
 /// Independent check of a per-fragment-sidx output: whole file verifies; one
 /// merkle box right before every moof; every sidx's first reference starts at
 /// its fragment's merkle box and covers through that fragment's mdat; init
-/// and leaf hashes recomputed here match the assertion.
-fn check_per_fragment_sidx_output(signed: &[u8]) {
+/// and leaf hashes recomputed here (optionally treating sidx as excluded)
+/// match the assertion.
+fn check_per_fragment_sidx_output(signed: &[u8], sidx_excluded: bool) {
     let hash = binding(signed);
     let map = &hash.merkle().unwrap()[0];
     let r = roots(signed);
@@ -1329,6 +1347,7 @@ fn check_per_fragment_sidx_output(signed: &[u8]) {
         let mut digest = Sha256::new();
         for b in r.iter().filter(|b| b.start >= start && b.end <= end) {
             let excluded = [*b"ftyp", *b"mfra", *b"free", *b"skip"].contains(&b.kind)
+                || (sidx_excluded && b.kind == *b"sidx")
                 || (b.kind == *b"uuid" && signed[b.payload..b.payload + 16] == C2PA_BOX_UUID);
             if !excluded {
                 digest.update((b.start as u64).to_be_bytes());
@@ -1351,22 +1370,86 @@ fn check_per_fragment_sidx_output(signed: &[u8]) {
     }
 }
 
-#[test]
-fn single_file_per_fragment_sidx_belongs_to_the_previous_leaf() {
-    let signed = sign(PER_FRAGMENT_SIDX);
-    check_per_fragment_sidx_output(&signed);
+fn exclusion_xpaths(signed: &[u8]) -> Vec<String> {
+    binding(signed)
+        .exclusions
+        .iter()
+        .map(|e| e.xpath.clone())
+        .collect()
+}
 
+#[test]
+fn single_file_sidx_is_bound_by_default() {
+    let signed = sign_with(PER_FRAGMENT_SIDX, false);
+    check_per_fragment_sidx_output(&signed, false);
+    assert!(!exclusion_xpaths(&signed).contains(&"/sidx".to_owned()));
+
+    // Without the exclusion a sidx-cut segment carries the previous leaf's
+    // sidx and lacks its own trailing one, so it cannot verify.
+    let (init, segments) = sidx_cut(&signed);
+    let (offset, segment) = &segments[1];
+    assert_segment_rejected(&init, segment, *offset, "sidx cut, sidx bound");
+}
+
+#[test]
+fn single_file_excluded_sidx_lets_sidx_cut_segments_verify() {
+    let signed = sign_with(PER_FRAGMENT_SIDX, true);
+    check_per_fragment_sidx_output(&signed, true);
+    assert!(exclusion_xpaths(&signed).contains(&"/sidx".to_owned()));
+
+    let (init, segments) = sidx_cut(&signed);
+    assert_eq!(segments.len(), 3);
+    for (offset, segment) in &segments {
+        assert_segment_valid(&init, segment, *offset);
+    }
+    // The spec's own cut still verifies, so validators that cut at the
+    // merkle boxes are unaffected.
     let (spec_init, spec_segments) = spec_cut(&signed);
-    assert_eq!(spec_segments.len(), 3);
     for (offset, segment) in &spec_segments {
         assert_segment_valid(&spec_init, segment, *offset);
     }
-
-    // A segment cut at its sidx carries the previous leaf's sidx and lacks
-    // its own trailing one.
-    let (init, segments) = sidx_cut(&signed);
+    // The offset is still load-bearing.
     let (offset, segment) = &segments[1];
-    assert_segment_rejected(&init, segment, *offset, "sidx cut");
+    assert_segment_rejected(&init, segment, offset + 1, "sidx cut at the wrong offset");
+}
+
+#[test]
+fn single_file_excluded_sidx_still_binds_the_media() {
+    let signed = sign_with(PER_FRAGMENT_SIDX, true);
+    let r = roots(&signed);
+    let moof = r.iter().filter(|b| b.kind == *b"moof").nth(1).unwrap();
+    let mdat = r.iter().filter(|b| b.kind == *b"mdat").nth(1).unwrap();
+    let sidx = r.iter().filter(|b| b.kind == *b"sidx").nth(1).unwrap();
+
+    for (at, what) in [(moof.payload + 4, "moof"), (mdat.payload + 10, "mdat")] {
+        let mut tampered = signed.clone();
+        tampered[at] ^= 0xff;
+        let reader = Reader::default()
+            .with_stream("video/mp4", Cursor::new(&tampered))
+            .unwrap();
+        assert_eq!(
+            reader.validation_state(),
+            ValidationState::Invalid,
+            "{what} tamper must fail"
+        );
+        let (init, segments) = sidx_cut(&tampered);
+        let (offset, segment) = &segments[1];
+        assert_segment_rejected(&init, segment, *offset, what);
+    }
+
+    // The documented trade-off: the sidx itself is no longer bound.
+    let mut tampered = signed.clone();
+    tampered[sidx.payload + 12] ^= 0xff;
+    let reader = Reader::default()
+        .with_stream("video/mp4", Cursor::new(&tampered))
+        .unwrap();
+    assert!(
+        matches!(
+            reader.validation_state(),
+            ValidationState::Valid | ValidationState::Trusted
+        ),
+        "{reader}"
+    );
 }
 
 // ---------------------------------------------------------------------------
